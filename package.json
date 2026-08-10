@@ -1,0 +1,33 @@
+{
+  "name": "chinese-animation-localizer",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "lint": "npm run lint --workspaces --if-present",
+    "format:check": "prettier --check package.json eslint.config.js .github/workflows/verify.yml packages/contracts/src/review.ts packages/contracts/src/jobs.ts",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "contracts:generate": "npm run generate --workspace=@localizer/contracts",
+    "contracts:check": "npm run check --workspace=@localizer/contracts",
+    "verify": "npm run lint && npm run format:check && npm run typecheck && npm run test && npm run contracts:check && python3 -m py_compile apps/processing-agent/src/localizer_agent/generated/models.py"
+  },
+  "devDependencies": {
+    "@asteasolutions/zod-to-openapi": "8.1.0",
+    "@eslint/js": "9.31.0",
+    "@types/node": "^24.13.3",
+    "eslint": "9.31.0",
+    "openapi-typescript": "7.8.0",
+    "prettier": "3.6.2",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.37.0"
+  }
+}

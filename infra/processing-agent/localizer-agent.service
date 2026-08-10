@@ -1,0 +1,22 @@
+[Unit]
+Description=Chinese animation localization IMPORT agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=localizer-agent
+Group=localizer-agent
+EnvironmentFile=/etc/localizer-agent/agent.env
+WorkingDirectory=/opt/localizer-agent
+ExecStart=/opt/localizer-agent/.venv/bin/python -m localizer_agent
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/localizer-agent
+
+[Install]
+WantedBy=multi-user.target

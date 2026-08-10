@@ -1,0 +1,14 @@
+version = 1
+revision = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "localizer-agent"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.7,<3" }]

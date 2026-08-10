@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Localization PoC gate result",
+  "type": "object",
+  "required": ["gate_id", "timestamp", "environment", "fixture_hash", "metrics", "redactions", "result", "reason", "fallback"],
+  "additionalProperties": false,
+  "properties": {
+    "gate_id": { "type": "string", "enum": ["local-fixtures", "access-lease", "manual-ingest", "oci-media", "azure-speech", "gemini", "youtube", "preview", "facebook", "source-adapters"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "environment": { "type": "string", "minLength": 1 },
+    "fixture_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "metrics": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean", "null"] } },
+    "redactions": { "type": "array", "items": { "type": "string" } },
+    "result": { "type": "string", "enum": ["PASS", "FAIL_FALLBACK", "BLOCKED"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "fallback": { "type": "string", "minLength": 1 }
+  }
+}

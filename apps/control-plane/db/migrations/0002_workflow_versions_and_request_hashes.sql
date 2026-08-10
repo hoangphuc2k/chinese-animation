@@ -1,0 +1,3 @@
+ALTER TABLE jobs ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE idempotency_records ADD COLUMN request_hash TEXT NOT NULL DEFAULT '';

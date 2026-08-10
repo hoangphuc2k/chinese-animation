@@ -1,0 +1,10 @@
+{
+  "contractVersion": "0.1.0",
+  "sourceOfTruth": "packages/contracts/src",
+  "schemas": [
+    "ApiError", "ApprovePublishRequest", "ApproveScriptRequest", "ClaimJobResponse",
+    "CompleteStepRequest", "CreateImportRequest", "DashboardInboxResponse",
+    "DestinationState", "HeartbeatRequest", "ProcessingState", "RenderReviewResponse",
+    "SegmentReviewResponse", "SourceState"
+  ]
+}

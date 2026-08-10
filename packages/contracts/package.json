@@ -1,0 +1,22 @@
+{
+  "name": "@localizer/contracts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "tsx scripts/generate.ts",
+    "check": "tsx scripts/check-generated.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src scripts"
+  },
+  "dependencies": {
+    "zod": "4.0.5"
+  },
+  "devDependencies": {
+    "@asteasolutions/zod-to-openapi": "8.1.0",
+    "openapi-typescript": "7.8.0",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3",
+    "vitest": "3.2.4"
+  }
+}

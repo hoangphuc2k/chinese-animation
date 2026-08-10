@@ -1,0 +1,22 @@
+{
+  "name": "@localizer/control-plane",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "wrangler types --include-runtime false --strict-vars false",
+    "db:migrate:local": "wrangler d1 migrations apply control-plane-local --local --persist-to .wrangler/state",
+    "dev": "wrangler dev",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "test:db": "vitest run test/migrations.test.ts test/repositories.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "4.12.25"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260729.1",
+    "vitest": "3.2.4",
+    "wrangler": "4.110.0"
+  }
+}

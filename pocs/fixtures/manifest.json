@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "fixtures": [
+    { "id": "synthetic-60s", "duration_seconds": 60, "path": "generated/synthetic-60s.mp4", "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "rights": "synthetic" },
+    { "id": "synthetic-15m", "duration_seconds": 900, "path": "generated/synthetic-15m.mp4", "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "rights": "synthetic" },
+    { "id": "synthetic-30m", "duration_seconds": 1800, "path": "generated/synthetic-30m.mp4", "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "rights": "synthetic" },
+    { "id": "synthetic-60m", "duration_seconds": 3600, "path": "generated/synthetic-60m.mp4", "sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "rights": "synthetic" }
+  ]
+}

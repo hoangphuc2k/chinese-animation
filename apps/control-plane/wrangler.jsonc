@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "chinese-animation-localizer-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "triggers": {
+    "crons": ["0 0 * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "CONTROL_PLANE_DB",
+      "database_name": "control-plane-local",
+      "migrations_dir": "db/migrations"
+    }
+  ],
+  "vars": {
+    "ACCESS_AUDIENCE": "local-access-audience",
+    "ACCESS_ISSUER": "https://access.example.invalid",
+    "ADMIN_EMAIL": "admin@example.invalid",
+    "AGENT_ACCESS_AUDIENCE": "local-agent-audience",
+    "AGENT_SERVICE_SUBJECT": "local-agent-subject",
+    "DEPLOYMENT_VERSION": "development",
+    "ENVIRONMENT": "development",
+    "PREVIEW_ORIGIN": "https://preview.example.invalid"
+  }
+}
