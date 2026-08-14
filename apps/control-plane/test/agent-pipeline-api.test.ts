@@ -24,6 +24,7 @@ describe("agent pipeline completion route", () => {
         complete: async (input: CompleteLeaseInput) => {
           completed = input;
         },
+        getScriptApproval: async () => null,
         heartbeat: async () => undefined,
       },
       nowUtc: () => "2026-08-07T00:00:00.000Z",

@@ -51,7 +51,8 @@ def transcription_claim() -> ClaimJobResponse:
                     "kind": "NORMALIZED_MEDIA",
                     "sha256": "a" * 64,
                     "toolVersion": "ffmpeg-normalize-v1",
-                }
+                },
+                "state": "TRANSCRIBING",
             },
             "requestId": "00000000-0000-4000-8000-000000000099",
             "state": "TRANSCRIBING",
@@ -158,3 +159,71 @@ def test_client_rejects_a_completion_for_a_state_other_than_the_claimed_state() 
         raise AssertionError("expected completion state mismatch")
 
     asyncio.run(scenario())
+
+
+def test_client_fetches_exact_script_approval_without_sending_script_text() -> None:
+    async def scenario() -> RecordingTransport:
+        transport = RecordingTransport(
+            [
+                HttpResponse(
+                    200,
+                    json.dumps(
+                        {
+                            "approved": True,
+                            "contentHash": "a" * 64,
+                            "jobId": "00000000-0000-4000-8000-000000000001",
+                            "scriptVersion": 2,
+                        }
+                    ).encode(),
+                )
+            ]
+        )
+        client = AgentControlPlaneClient("https://control-plane.example.test", "sensitive-token", transport)
+
+        approval = await client.get_script_approval(
+            "00000000-0000-4000-8000-000000000001",
+            script_version=2,
+            content_sha256="a" * 64,
+        )
+
+        assert approval is not None and approval.approved
+        return transport
+
+    transport = asyncio.run(scenario())
+    method, url, _, body = transport.calls[0]
+    assert method == "GET"
+    assert "scriptVersion=2" in url and f"contentHash={'a' * 64}" in url
+    assert body is None
+
+
+def test_client_accepts_a_translation_claim_with_state_specific_input() -> None:
+    async def scenario() -> ClaimJobResponse | None:
+        response = {
+            "jobId": "00000000-0000-4000-8000-000000000001",
+            "jobType": "LOCALIZE",
+            "jobVersion": 4,
+            "leaseExpiresAtUtc": "2026-08-04T00:05:00Z",
+            "leaseToken": "t" * 43,
+            "pipelineInput": {
+                "googleProcessingAllowed": True,
+                "state": "TRANSLATING",
+                "transcript": {
+                    "artifactRef": "transcript-01.json",
+                    "byteCount": 512,
+                    "kind": "TRANSCRIPT",
+                    "sha256": "a" * 64,
+                    "toolVersion": "whisper.cpp-1.7.4",
+                },
+            },
+            "requestId": "00000000-0000-4000-8000-000000000099",
+            "state": "TRANSLATING",
+        }
+        client = AgentControlPlaneClient(
+            "https://control-plane.example.test",
+            "sensitive-token",
+            RecordingTransport([HttpResponse(200, json.dumps(response).encode())]),
+        )
+        return await client.claim(["LOCALIZE"], ["TRANSLATING"])
+
+    claim = asyncio.run(scenario())
+    assert claim is not None and claim.state == "TRANSLATING"

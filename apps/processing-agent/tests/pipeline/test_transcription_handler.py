@@ -61,7 +61,8 @@ def test_transcription_handler_verifies_input_and_completes_with_immutable_linea
                     "kind": "NORMALIZED_MEDIA",
                     "sha256": normalized_hash,
                     "toolVersion": "ffmpeg-normalize-v1",
-                }
+                },
+                "state": "TRANSCRIBING",
             },
             "requestId": "00000000-0000-4000-8000-000000000099",
             "state": "TRANSCRIBING",

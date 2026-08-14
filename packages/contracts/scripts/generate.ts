@@ -73,11 +73,52 @@ const agentSchemas = {
     },
     additionalProperties: false,
   },
-  PipelineClaimInput: {
+  TranscriptionPipelineInput: {
     type: "object",
-    required: ["normalizedMedia"],
-    properties: { normalizedMedia: { $ref: "#/components/schemas/PipelineArtifact" } },
+    required: ["normalizedMedia", "state"],
+    properties: { normalizedMedia: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "TRANSCRIBING" } },
     additionalProperties: false,
+  },
+  TranslationPipelineInput: {
+    type: "object",
+    required: ["googleProcessingAllowed", "state", "transcript"],
+    properties: { googleProcessingAllowed: { const: true }, state: { const: "TRANSLATING" }, transcript: { $ref: "#/components/schemas/PipelineArtifact" } },
+    additionalProperties: false,
+  },
+  VoicePipelineInput: {
+    type: "object",
+    required: ["script", "scriptSha256", "scriptVersion", "state"],
+    properties: { script: { $ref: "#/components/schemas/PipelineArtifact" }, scriptSha256: { type: "string", pattern: "^[a-f0-9]{64}$" }, scriptVersion: { type: "integer", minimum: 1 }, state: { const: "GENERATING_VOICE" } },
+    additionalProperties: false,
+  },
+  MixingPipelineInput: {
+    type: "object",
+    required: ["script", "state", "voice"],
+    properties: { script: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "MIXING" }, voice: { $ref: "#/components/schemas/PipelineArtifact" } },
+    additionalProperties: false,
+  },
+  RenderingPipelineInput: {
+    type: "object",
+    required: ["mixedAudio", "normalizedMedia", "scriptSha256", "scriptVersion", "state", "subtitles"],
+    properties: { mixedAudio: { $ref: "#/components/schemas/PipelineArtifact" }, normalizedMedia: { $ref: "#/components/schemas/PipelineArtifact" }, scriptSha256: { type: "string", pattern: "^[a-f0-9]{64}$" }, scriptVersion: { type: "integer", minimum: 1 }, state: { const: "RENDERING" }, subtitles: { $ref: "#/components/schemas/PipelineArtifact" } },
+    additionalProperties: false,
+  },
+  PreviewPipelineInput: {
+    type: "object",
+    required: ["render", "state", "subtitles"],
+    properties: { render: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "READY_FOR_PREVIEW" }, subtitles: { $ref: "#/components/schemas/PipelineArtifact" } },
+    additionalProperties: false,
+  },
+  PipelineClaimInput: {
+    oneOf: [
+      { $ref: "#/components/schemas/TranscriptionPipelineInput" },
+      { $ref: "#/components/schemas/TranslationPipelineInput" },
+      { $ref: "#/components/schemas/VoicePipelineInput" },
+      { $ref: "#/components/schemas/MixingPipelineInput" },
+      { $ref: "#/components/schemas/RenderingPipelineInput" },
+      { $ref: "#/components/schemas/PreviewPipelineInput" },
+    ],
+    discriminator: { propertyName: "state" },
   },
   ClaimJobResponse: {
     type: "object",
@@ -134,7 +175,7 @@ const pyWithPipelineArtifacts = pyWithHeartbeat
   )
   .replace(
     "class ClaimJobResponse(BaseModel):",
-    "class PipelineArtifact(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    artifactRef: str = Field(min_length=1, max_length=160, pattern=r\"^[A-Za-z0-9._:-]+$\")\n    byteCount: int = Field(ge=0)\n    kind: ArtifactKind\n    sha256: str = Field(pattern=r\"^[a-f0-9]{64}$\")\n    toolVersion: str = Field(min_length=1, max_length=160)\n\n\nclass PipelineClaimInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    normalizedMedia: PipelineArtifact\n\n\nclass ClaimJobResponse(BaseModel):",
+    "class PipelineArtifact(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    artifactRef: str = Field(min_length=1, max_length=160, pattern=r\"^[A-Za-z0-9._:-]+$\")\n    byteCount: int = Field(ge=0)\n    kind: ArtifactKind\n    sha256: str = Field(pattern=r\"^[a-f0-9]{64}$\")\n    toolVersion: str = Field(min_length=1, max_length=160)\n\n\nclass TranscriptionPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    normalizedMedia: PipelineArtifact\n    state: Literal[\"TRANSCRIBING\"]\n\n\nclass TranslationPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    googleProcessingAllowed: Literal[True]\n    state: Literal[\"TRANSLATING\"]\n    transcript: PipelineArtifact\n\n\nclass VoicePipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    script: PipelineArtifact\n    scriptSha256: str = Field(pattern=r\"^[a-f0-9]{64}$\")\n    scriptVersion: int = Field(gt=0)\n    state: Literal[\"GENERATING_VOICE\"]\n\n\nclass MixingPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    script: PipelineArtifact\n    state: Literal[\"MIXING\"]\n    voice: PipelineArtifact\n\n\nclass RenderingPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    mixedAudio: PipelineArtifact\n    normalizedMedia: PipelineArtifact\n    scriptSha256: str = Field(pattern=r\"^[a-f0-9]{64}$\")\n    scriptVersion: int = Field(gt=0)\n    state: Literal[\"RENDERING\"]\n    subtitles: PipelineArtifact\n\n\nclass PreviewPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    render: PipelineArtifact\n    state: Literal[\"READY_FOR_PREVIEW\"]\n    subtitles: PipelineArtifact\n\n\nPipelineClaimInput = Annotated[Union[TranscriptionPipelineInput, TranslationPipelineInput, VoicePipelineInput, MixingPipelineInput, RenderingPipelineInput, PreviewPipelineInput], Field(discriminator=\"state\")]\n\n\nclass ClaimJobResponse(BaseModel):",
   )
   .replace(
     "    ingestResult: IngestResult | None = None\n    segmentIds: list[str] | None = None\n",

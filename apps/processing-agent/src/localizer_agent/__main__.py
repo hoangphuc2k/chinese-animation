@@ -6,7 +6,9 @@ import asyncio
 
 from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
+from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
+from localizer_agent.pipeline.stages import GeminiTranslationOperations, TranslationHandler
 from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
 from localizer_agent.pipeline.transcription_stage import TranscriptionHandler
 from localizer_agent.structured_logging import create_logger
@@ -33,6 +35,7 @@ async def run() -> None:
         config.request_timeout_seconds,
     )
     handlers: dict[str, StageHandler] = {"QUEUED": import_supervisor, "INGESTING": import_supervisor}
+    job_types_by_state = {"QUEUED": ["IMPORT"], "INGESTING": ["IMPORT"]}
     if config.whisper_binary_path is not None and config.whisper_model_path is not None and config.whisper_model_sha256 is not None:
         whisper = WhisperCpp(
             config.whisper_binary_path,
@@ -48,10 +51,27 @@ async def run() -> None:
             heartbeat_interval_seconds=config.heartbeat_interval_seconds,
             tool_version=config.whisper_binary_version,
         )
+        job_types_by_state["TRANSCRIBING"] = ["IMPORT", "LOCALIZE"]
+    if config.gemini_api_key is not None and config.gemini_base_url is not None and config.gemini_model_id is not None:
+        gemini = GeminiClient(
+            config.gemini_base_url,
+            config.gemini_model_id,
+            config.gemini_api_key,
+            timeout_seconds=config.request_timeout_seconds,
+        )
+        handlers["TRANSLATING"] = TranslationHandler(
+            client,
+            workspace_manager,
+            GeminiTranslationOperations(gemini),
+            config_version=f"{config.gemini_model_id}:prompt-v1",
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+            tool_version=config.gemini_model_id,
+        )
+        job_types_by_state["TRANSLATING"] = ["IMPORT", "LOCALIZE"]
     supervisor = ProcessingSupervisor(
         client,
         handlers,
-        supported_job_types=["IMPORT"],
+        job_types_by_state=job_types_by_state,
     )
     while True:
         try:

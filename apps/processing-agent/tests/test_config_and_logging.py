@@ -57,6 +57,27 @@ def test_config_enables_whisper_only_with_a_complete_pinned_toolchain(tmp_path: 
         AgentConfig.from_env(values)
 
 
+def test_config_enables_gemini_only_with_complete_provider_settings(tmp_path: Path) -> None:
+    values = {
+        "AGENT_ACCESS_TOKEN": "sensitive-token",
+        "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "GEMINI_API_KEY": "gemini-secret",
+        "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
+        "GEMINI_MODEL_ID": "gemini-2.5-flash",
+        "INBOX_ROOT": str(tmp_path / "inbox"),
+        "WORKSPACE_ROOT": str(tmp_path / "workspace"),
+    }
+
+    config = AgentConfig.from_env(values)
+
+    assert config.gemini_model_id == "gemini-2.5-flash"
+    assert "gemini-secret" not in repr(config)
+
+    values.pop("GEMINI_MODEL_ID")
+    with pytest.raises(ConfigurationError):
+        AgentConfig.from_env(values)
+
+
 def test_structured_logs_redact_credentials_urls_and_paths() -> None:
     entries: list[str] = []
     logger = create_logger(entries.append)

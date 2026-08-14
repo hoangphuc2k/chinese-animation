@@ -1,4 +1,4 @@
-import { ImportInput, IngestResult, PipelineClaimInput, type PipelineArtifact } from "../../../../packages/contracts/src/jobs";
+import { ImportInput, IngestResult, PipelineArtifact, PipelineClaimInput } from "../../../../packages/contracts/src/jobs";
 import type { JobType, ProcessingState } from "../../../../packages/contracts/src/states";
 
 import { assertJobTransition } from "../domain/job-state-machine";
@@ -20,7 +20,10 @@ interface ClaimedJobRow extends Record<string, unknown> {
   job_type: JobType;
   lease_until: string;
   metadata_json: string | null;
+  pipeline_lineage_json: string | null;
   rights_metadata_json: string | null;
+  script_hash: string | null;
+  script_version: number | null;
   source_asset_id: string | null;
   status: ProcessingState;
   version: number;
@@ -53,6 +56,16 @@ export interface HeartbeatLeaseInput {
   leaseExpiresAtUtc: string;
   leaseToken: string;
   nowUtc: string;
+}
+
+export interface ScriptApprovalLookupInput {
+  contentHash: string;
+  jobId: string;
+  scriptVersion: number;
+}
+
+export interface ScriptApprovalSnapshot extends ScriptApprovalLookupInput {
+  approved: true;
 }
 
 export interface CompleteLeaseInput {
@@ -115,7 +128,101 @@ function transcriptionInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
       sha256: ingestResult.normalizedHash,
       toolVersion: "ffmpeg-normalize-v1",
     },
+    state: "TRANSCRIBING",
   });
+}
+
+function pipelineArtifactsFromClaim(row: ClaimedJobRow): PipelineArtifact[] {
+  if (!row.pipeline_lineage_json) return [];
+  const stored: unknown = JSON.parse(row.pipeline_lineage_json);
+  if (!Array.isArray(stored)) throw new Error("Pipeline lineage must be an array.");
+  return stored.flatMap((entry) => {
+    const artifacts = Array.isArray(entry) ? entry : [entry];
+    return artifacts.map((artifact) => PipelineArtifact.parse(artifact));
+  });
+}
+
+function latestArtifact(artifacts: readonly PipelineArtifact[], kind: PipelineArtifact["kind"]): PipelineArtifact {
+  for (let index = artifacts.length - 1; index >= 0; index -= 1) {
+    const artifact = artifacts[index];
+    if (artifact?.kind === kind) return artifact;
+  }
+  throw new Error(`Pipeline claim is missing ${kind} lineage.`);
+}
+
+function googleProcessingAllowed(row: ClaimedJobRow): true {
+  if (!row.rights_metadata_json) throw new Error("Translation claim is missing its rights policy.");
+  const metadata: unknown = JSON.parse(row.rights_metadata_json);
+  const processors =
+    typeof metadata === "object" && metadata !== null
+      ? (metadata as { allowedProcessors?: unknown }).allowedProcessors
+      : undefined;
+  if (!Array.isArray(processors) || !processors.includes("GOOGLE_GEMINI")) {
+    throw new Error("Translation rights do not permit Google Gemini processing.");
+  }
+  return true;
+}
+
+function exactScript(row: ClaimedJobRow, artifacts: readonly PipelineArtifact[]): {
+  script: PipelineArtifact;
+  scriptSha256: string;
+  scriptVersion: number;
+} {
+  const script = latestArtifact(artifacts, "SCRIPT");
+  if (!row.script_hash || !row.script_version || script.sha256 !== row.script_hash) {
+    throw new Error("Pipeline claim has inconsistent script identity.");
+  }
+  return { script, scriptSha256: row.script_hash, scriptVersion: row.script_version };
+}
+
+function pipelineInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
+  if (row.status === "TRANSCRIBING") return transcriptionInputFromClaim(row);
+  const artifacts = pipelineArtifactsFromClaim(row);
+  if (row.status === "TRANSLATING") {
+    return PipelineClaimInput.parse({
+      googleProcessingAllowed: googleProcessingAllowed(row),
+      state: row.status,
+      transcript: latestArtifact(artifacts, "TRANSCRIPT"),
+    });
+  }
+  if (row.status === "GENERATING_VOICE") {
+    return PipelineClaimInput.parse({ ...exactScript(row, artifacts), state: row.status });
+  }
+  if (row.status === "MIXING") {
+    return PipelineClaimInput.parse({
+      script: latestArtifact(artifacts, "SCRIPT"),
+      state: row.status,
+      voice: latestArtifact(artifacts, "VOICE"),
+    });
+  }
+  if (row.status === "RENDERING") {
+    const ingestResult = ingestResultFromClaim(row);
+    if (!ingestResult) throw new Error("Render claim is missing normalized-media lineage.");
+    const normalizedMedia = PipelineArtifact.parse({
+      artifactRef: "normalized-media",
+      byteCount: ingestResult.normalizedByteCount,
+      kind: "NORMALIZED_MEDIA",
+      sha256: ingestResult.normalizedHash,
+      toolVersion: "ffmpeg-normalize-v1",
+    });
+    const { scriptSha256, scriptVersion } = exactScript(row, artifacts);
+    return PipelineClaimInput.parse({
+      mixedAudio: latestArtifact(artifacts, "MIXED_AUDIO"),
+      normalizedMedia,
+      scriptSha256,
+      scriptVersion,
+      state: row.status,
+      subtitles: latestArtifact(artifacts, "SUBTITLES"),
+    });
+  }
+  if (row.status === "READY_FOR_PREVIEW") {
+    return PipelineClaimInput.parse({
+      render: latestArtifact(artifacts, "RENDER"),
+      state: row.status,
+      subtitles: latestArtifact(artifacts, "SUBTITLES"),
+    });
+  }
+  throw new Error("Unsupported pipeline claim state.");
 }
 
 export class LeaseService {
@@ -133,7 +240,7 @@ export class LeaseService {
     const statePlaceholders = input.supportedStates.map(() => "?").join(", ");
     const claimed = await this.database
       .prepare(
-        `WITH candidate AS (SELECT jobs.id, jobs.version FROM jobs LEFT JOIN source_assets AS source_asset ON source_asset.id = jobs.source_asset_id WHERE jobs.status IN (${statePlaceholders}) AND jobs.available_at <= ? AND (jobs.lease_until IS NULL OR jobs.lease_until <= ?) AND jobs.job_type IN (${jobTypePlaceholders}) AND (jobs.job_type <> 'IMPORT' OR (source_asset.id IS NOT NULL AND source_asset.rights_revoked_at IS NULL)) ORDER BY jobs.priority DESC, jobs.created_at ASC LIMIT 1) UPDATE jobs SET lease_owner = ?, lease_token_hash = ?, lease_until = ?, attempt_count = attempt_count + 1, version = version + 1, updated_at = ? WHERE id = (SELECT id FROM candidate) AND version = (SELECT version FROM candidate) AND (lease_until IS NULL OR lease_until <= ?) RETURNING id, job_type, status, version, lease_until, source_asset_id, ingest_result_json, (SELECT metadata_json FROM source_assets WHERE id = source_asset_id) AS metadata_json, (SELECT rights_metadata_json FROM source_assets WHERE id = source_asset_id) AS rights_metadata_json`,
+        `WITH candidate AS (SELECT jobs.id, jobs.version FROM jobs LEFT JOIN source_assets AS source_asset ON source_asset.id = jobs.source_asset_id WHERE jobs.status IN (${statePlaceholders}) AND jobs.available_at <= ? AND (jobs.lease_until IS NULL OR jobs.lease_until <= ?) AND jobs.job_type IN (${jobTypePlaceholders}) AND (jobs.job_type <> 'IMPORT' OR (source_asset.id IS NOT NULL AND source_asset.rights_revoked_at IS NULL)) ORDER BY jobs.priority DESC, jobs.created_at ASC LIMIT 1) UPDATE jobs SET lease_owner = ?, lease_token_hash = ?, lease_until = ?, attempt_count = attempt_count + 1, version = version + 1, updated_at = ? WHERE id = (SELECT id FROM candidate) AND version = (SELECT version FROM candidate) AND (lease_until IS NULL OR lease_until <= ?) RETURNING id, job_type, status, version, lease_until, source_asset_id, ingest_result_json, pipeline_lineage_json, (SELECT metadata_json FROM source_assets WHERE id = source_asset_id) AS metadata_json, (SELECT rights_metadata_json FROM source_assets WHERE id = source_asset_id) AS rights_metadata_json, (SELECT content_hash FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_hash, (SELECT version FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_version`,
       )
       .bind(
         ...input.supportedStates,
@@ -156,8 +263,8 @@ export class LeaseService {
       leaseToken,
       state: claimed.status,
     };
-    if (claimed.status === "TRANSCRIBING") {
-      return { ...lease, pipelineInput: transcriptionInputFromClaim(claimed) };
+    if (["TRANSCRIBING", "TRANSLATING", "GENERATING_VOICE", "MIXING", "RENDERING", "READY_FOR_PREVIEW"].includes(claimed.status)) {
+      return { ...lease, pipelineInput: pipelineInputFromClaim(claimed) };
     }
     if (claimed.job_type !== "IMPORT") return lease;
     if (claimed.status === "QUEUED" || claimed.status === "INGESTING") {
@@ -165,6 +272,16 @@ export class LeaseService {
     }
     const ingestResult = ingestResultFromClaim(claimed);
     return ingestResult ? { ...lease, ingestResult } : lease;
+  }
+
+  async getScriptApproval(input: ScriptApprovalLookupInput): Promise<ScriptApprovalSnapshot | null> {
+    const approval = await this.database
+      .prepare(
+        "SELECT 1 AS approved FROM approvals WHERE job_id = ? AND approval_type = 'SCRIPT_APPROVED' AND version = ? AND content_hash = ? AND invalidated_at IS NULL LIMIT 1",
+      )
+      .bind(input.jobId, input.scriptVersion, input.contentHash)
+      .first<{ approved: number }>();
+    return approval?.approved === 1 ? { approved: true, ...input } : null;
   }
 
   async heartbeat(input: HeartbeatLeaseInput): Promise<void> {

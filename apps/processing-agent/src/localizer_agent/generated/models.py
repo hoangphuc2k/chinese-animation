@@ -61,9 +61,52 @@ class PipelineArtifact(BaseModel):
     toolVersion: str = Field(min_length=1, max_length=160)
 
 
-class PipelineClaimInput(BaseModel):
+class TranscriptionPipelineInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     normalizedMedia: PipelineArtifact
+    state: Literal["TRANSCRIBING"]
+
+
+class TranslationPipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    googleProcessingAllowed: Literal[True]
+    state: Literal["TRANSLATING"]
+    transcript: PipelineArtifact
+
+
+class VoicePipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    script: PipelineArtifact
+    scriptSha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    scriptVersion: int = Field(gt=0)
+    state: Literal["GENERATING_VOICE"]
+
+
+class MixingPipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    script: PipelineArtifact
+    state: Literal["MIXING"]
+    voice: PipelineArtifact
+
+
+class RenderingPipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mixedAudio: PipelineArtifact
+    normalizedMedia: PipelineArtifact
+    scriptSha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    scriptVersion: int = Field(gt=0)
+    state: Literal["RENDERING"]
+    subtitles: PipelineArtifact
+
+
+class PreviewPipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    render: PipelineArtifact
+    state: Literal["READY_FOR_PREVIEW"]
+    subtitles: PipelineArtifact
+
+
+PipelineClaimInput = Annotated[Union[TranscriptionPipelineInput, TranslationPipelineInput, VoicePipelineInput, MixingPipelineInput, RenderingPipelineInput, PreviewPipelineInput], Field(discriminator="state")]
 
 
 class ClaimJobResponse(BaseModel):

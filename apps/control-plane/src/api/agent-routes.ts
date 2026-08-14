@@ -1,12 +1,15 @@
 import { Hono, type MiddlewareHandler } from "hono";
+import { z } from "zod";
 
 import { ClaimJobRequest, ClaimJobResponse, CompleteStepRequest, HeartbeatRequest } from "../../../../packages/contracts/src/jobs";
+import { Sha256 } from "../../../../packages/contracts/src/ids";
 import type { AuthContext } from "../middleware/access-auth";
-import { LeaseInvalidError, type ClaimedLease, type ClaimLeaseInput, type CompleteLeaseInput, type HeartbeatLeaseInput } from "../services/lease-service";
+import { LeaseInvalidError, type ClaimedLease, type ClaimLeaseInput, type CompleteLeaseInput, type HeartbeatLeaseInput, type ScriptApprovalLookupInput, type ScriptApprovalSnapshot } from "../services/lease-service";
 
 export interface AgentLeaseService {
   claim(input: ClaimLeaseInput): Promise<ClaimedLease | null>;
   complete(input: CompleteLeaseInput): Promise<void>;
+  getScriptApproval(input: ScriptApprovalLookupInput): Promise<ScriptApprovalSnapshot | null>;
   heartbeat(input: HeartbeatLeaseInput): Promise<void>;
 }
 
@@ -86,6 +89,21 @@ export function createAgentRoutes(options: AgentRoutesOptions): Hono<{ Variables
       if (error instanceof LeaseInvalidError) return problem("LEASE_INVALID", error.message, requestId(), 409);
       throw error;
     }
+  });
+
+  routes.get("/jobs/:jobId/script-approval", async (context) => {
+    const query = z
+      .object({ contentHash: Sha256, scriptVersion: z.coerce.number().int().positive() })
+      .strict()
+      .safeParse(context.req.query());
+    if (!query.success) return problem("VALIDATION_FAILED", "Invalid script approval lookup.", requestId(), 400);
+    const approval = await options.leaseService.getScriptApproval({
+      contentHash: query.data.contentHash,
+      jobId: context.req.param("jobId"),
+      scriptVersion: query.data.scriptVersion,
+    });
+    if (!approval) return problem("NOT_FOUND", "No matching active script approval exists.", requestId(), 404);
+    return context.json(approval);
   });
 
   routes.post("/jobs/:jobId/complete", async (context) => {

@@ -24,22 +24,30 @@ class ProcessingSupervisor:
         client: ClaimClient,
         handlers: Mapping[str, StageHandler],
         *,
-        supported_job_types: Sequence[JobType],
+        supported_job_types: Sequence[JobType] | None = None,
+        job_types_by_state: Mapping[str, Sequence[JobType]] | None = None,
     ) -> None:
         if not handlers:
             raise ValueError("At least one processing-state handler is required.")
-        if not supported_job_types:
-            raise ValueError("At least one supported job type is required.")
+        if job_types_by_state is not None:
+            if supported_job_types is not None or set(job_types_by_state) != set(handlers) or any(not types for types in job_types_by_state.values()):
+                raise ValueError("Every handler requires one explicit non-empty job-type capability.")
+            capabilities = {state: tuple(job_types_by_state[state]) for state in handlers}
+        else:
+            if not supported_job_types:
+                raise ValueError("At least one supported job type is required.")
+            capabilities = {state: tuple(supported_job_types) for state in handlers}
         self._client = client
         self._handlers = dict(handlers)
-        self._supported_job_types = tuple(supported_job_types)
+        self._job_types_by_state = capabilities
 
     async def run_once(self) -> bool:
-        claim = await self._client.claim(self._supported_job_types, tuple(self._handlers))
-        if claim is None:
-            return False
-        handler = self._handlers.get(claim.state)
-        if handler is None:
-            raise RuntimeError("Control plane returned a state outside the declared agent capability set.")
-        await handler.handle(claim)
-        return True
+        for state, handler in self._handlers.items():
+            claim = await self._client.claim(self._job_types_by_state[state], [state])
+            if claim is None:
+                continue
+            if claim.state != state:
+                raise RuntimeError("Control plane returned a state outside the declared agent capability set.")
+            await handler.handle(claim)
+            return True
+        return False

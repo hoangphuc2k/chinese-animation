@@ -412,12 +412,161 @@
         "additionalProperties": false
       },
       "PipelineClaimInput": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TranscriptionPipelineInput"
+          },
+          {
+            "$ref": "#/components/schemas/TranslationPipelineInput"
+          },
+          {
+            "$ref": "#/components/schemas/VoicePipelineInput"
+          },
+          {
+            "$ref": "#/components/schemas/MixingPipelineInput"
+          },
+          {
+            "$ref": "#/components/schemas/RenderingPipelineInput"
+          },
+          {
+            "$ref": "#/components/schemas/PreviewPipelineInput"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "state"
+        }
+      },
+      "TranscriptionPipelineInput": {
         "type": "object",
         "required": [
-          "normalizedMedia"
+          "normalizedMedia",
+          "state"
         ],
         "properties": {
           "normalizedMedia": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "state": {
+            "const": "TRANSCRIBING"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TranslationPipelineInput": {
+        "type": "object",
+        "required": [
+          "googleProcessingAllowed",
+          "state",
+          "transcript"
+        ],
+        "properties": {
+          "googleProcessingAllowed": {
+            "const": true
+          },
+          "state": {
+            "const": "TRANSLATING"
+          },
+          "transcript": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          }
+        },
+        "additionalProperties": false
+      },
+      "VoicePipelineInput": {
+        "type": "object",
+        "required": [
+          "script",
+          "scriptSha256",
+          "scriptVersion",
+          "state"
+        ],
+        "properties": {
+          "script": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "scriptSha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "scriptVersion": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "state": {
+            "const": "GENERATING_VOICE"
+          }
+        },
+        "additionalProperties": false
+      },
+      "MixingPipelineInput": {
+        "type": "object",
+        "required": [
+          "script",
+          "state",
+          "voice"
+        ],
+        "properties": {
+          "script": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "state": {
+            "const": "MIXING"
+          },
+          "voice": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RenderingPipelineInput": {
+        "type": "object",
+        "required": [
+          "mixedAudio",
+          "normalizedMedia",
+          "scriptSha256",
+          "scriptVersion",
+          "state",
+          "subtitles"
+        ],
+        "properties": {
+          "mixedAudio": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "normalizedMedia": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "scriptSha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "scriptVersion": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "state": {
+            "const": "RENDERING"
+          },
+          "subtitles": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PreviewPipelineInput": {
+        "type": "object",
+        "required": [
+          "render",
+          "state",
+          "subtitles"
+        ],
+        "properties": {
+          "render": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "state": {
+            "const": "READY_FOR_PREVIEW"
+          },
+          "subtitles": {
             "$ref": "#/components/schemas/PipelineArtifact"
           }
         },

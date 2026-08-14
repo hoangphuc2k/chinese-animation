@@ -21,7 +21,8 @@ def claim(state: str = "TRANSCRIBING") -> ClaimJobResponse:
                     "kind": "NORMALIZED_MEDIA",
                     "sha256": "a" * 64,
                     "toolVersion": "ffmpeg-normalize-v1",
-                }
+                },
+                "state": "TRANSCRIBING",
             },
             "requestId": "00000000-0000-4000-8000-000000000099",
             "state": state,
@@ -32,10 +33,10 @@ def claim(state: str = "TRANSCRIBING") -> ClaimJobResponse:
 class RecordingClient:
     def __init__(self, result: ClaimJobResponse | None) -> None:
         self.result = result
-        self.capabilities: tuple[list[str], list[str]] | None = None
+        self.capabilities: list[tuple[list[str], list[str]]] = []
 
     async def claim(self, job_types, states):
-        self.capabilities = (list(job_types), list(states))
+        self.capabilities.append((list(job_types), list(states)))
         return self.result
 
 
@@ -53,7 +54,7 @@ def test_supervisor_advertises_and_dispatches_only_registered_states() -> None:
     supervisor = ProcessingSupervisor(client, {"TRANSCRIBING": handler}, supported_job_types=["IMPORT"])
 
     assert asyncio.run(supervisor.run_once()) is True
-    assert client.capabilities == (["IMPORT"], ["TRANSCRIBING"])
+    assert client.capabilities == [(["IMPORT"], ["TRANSCRIBING"])]
     assert [item.state for item in handler.claims] == ["TRANSCRIBING"]
 
 
@@ -66,3 +67,22 @@ def test_supervisor_does_not_claim_when_no_state_handler_is_registered() -> None
         assert "handler" in str(error).lower()
     else:
         raise AssertionError("expected an empty capability map to be rejected")
+
+
+def test_supervisor_does_not_advertise_a_cross_product_of_job_types_and_states() -> None:
+    class SequencedClient(RecordingClient):
+        async def claim(self, job_types, states):
+            self.capabilities.append((list(job_types), list(states)))
+            return None
+
+    client = SequencedClient(None)
+    import_handler = RecordingHandler()
+    translation_handler = RecordingHandler()
+    supervisor = ProcessingSupervisor(
+        client,
+        {"QUEUED": import_handler, "TRANSLATING": translation_handler},
+        job_types_by_state={"QUEUED": ["IMPORT"], "TRANSLATING": ["IMPORT", "LOCALIZE"]},
+    )
+
+    assert asyncio.run(supervisor.run_once()) is False
+    assert client.capabilities == [(["IMPORT"], ["QUEUED"]), (["IMPORT", "LOCALIZE"], ["TRANSLATING"])]

@@ -33,6 +33,7 @@ function service(overrides: Partial<AgentLeaseService> = {}): AgentLeaseService 
       state: "QUEUED",
     }),
     complete: async () => undefined,
+    getScriptApproval: async () => null,
     heartbeat: async () => undefined,
     ...overrides,
   };
@@ -136,6 +137,24 @@ describe("agent routes", () => {
     );
 
     expect(response.status).toBe(400);
+  });
+
+  it("returns only an exact active script approval to an authenticated agent", async () => {
+    const leaseService = service() as AgentLeaseService & {
+      getScriptApproval(input: { contentHash: string; jobId: string; scriptVersion: number }): Promise<unknown>;
+    };
+    leaseService.getScriptApproval = async (input) => ({ approved: true, ...input });
+    const response = await app(agentAuth(), leaseService).request(
+      `https://control-plane.test/api/v1/agent/jobs/00000000-0000-4000-8000-000000000001/script-approval?scriptVersion=2&contentHash=${"a".repeat(64)}`,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      approved: true,
+      contentHash: "a".repeat(64),
+      jobId: "00000000-0000-4000-8000-000000000001",
+      scriptVersion: 2,
+    });
   });
 
   it("maps an invalid completion lease to LEASE_INVALID", async () => {

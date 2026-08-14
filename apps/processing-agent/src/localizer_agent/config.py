@@ -53,6 +53,18 @@ def _whisper_configuration(values: Mapping[str, str]) -> tuple[Path | None, Path
     return Path(binary).expanduser(), Path(model).expanduser(), model_sha256
 
 
+def _gemini_configuration(values: Mapping[str, str]) -> tuple[str | None, str | None, str | None]:
+    api_key = values.get("GEMINI_API_KEY", "").strip()
+    base_url = values.get("GEMINI_BASE_URL", "").strip()
+    model_id = values.get("GEMINI_MODEL_ID", "").strip()
+    if not api_key and not base_url and not model_id:
+        return None, None, None
+    parsed = urlparse(base_url)
+    if not api_key or not model_id or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ConfigurationError("Gemini requires an API key, model ID and credential-free HTTPS base URL together")
+    return api_key, base_url.rstrip("/"), model_id
+
+
 @dataclass(frozen=True, repr=False)
 class AgentConfig:
     control_plane_url: str
@@ -64,6 +76,9 @@ class AgentConfig:
     request_timeout_seconds: int = 30
     max_source_bytes: int = 20 * 1024 * 1024 * 1024
     minimum_free_bytes: int = 5 * 1024 * 1024 * 1024
+    gemini_api_key: str | None = field(default=None, repr=False)
+    gemini_base_url: str | None = None
+    gemini_model_id: str | None = None
     whisper_binary_path: Path | None = None
     whisper_model_path: Path | None = None
     whisper_model_sha256: str | None = None
@@ -75,9 +90,13 @@ class AgentConfig:
         workspace_root = Path(_required(env, "WORKSPACE_ROOT")).expanduser()
         inbox_root = Path(_required(env, "INBOX_ROOT")).expanduser()
         whisper_binary_path, whisper_model_path, whisper_model_sha256 = _whisper_configuration(env)
+        gemini_api_key, gemini_base_url, gemini_model_id = _gemini_configuration(env)
         return cls(
             access_token=_required(env, "AGENT_ACCESS_TOKEN"),
             control_plane_url=_control_plane_origin(_required(env, "CONTROL_PLANE_URL")),
+            gemini_api_key=gemini_api_key,
+            gemini_base_url=gemini_base_url,
+            gemini_model_id=gemini_model_id,
             heartbeat_interval_seconds=_positive_int(env, "HEARTBEAT_INTERVAL_SECONDS", 30, 300),
             inbox_root=inbox_root,
             max_source_bytes=_positive_int(env, "MAX_SOURCE_BYTES", 20 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024),

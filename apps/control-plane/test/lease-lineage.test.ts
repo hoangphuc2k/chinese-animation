@@ -55,10 +55,54 @@ class ImportClaimDatabase implements LeaseDatabase {
           job_type: "IMPORT",
           lease_until: "2026-08-07T00:01:00Z",
           metadata_json: JSON.stringify({ locator: { inboxFileId: "creator-submission-42", kind: "OCI_INBOX_FILE" } }),
+          pipeline_lineage_json: "[]",
           rights_metadata_json: JSON.stringify({ evidenceHash: "c".repeat(64) }),
+          script_hash: null,
+          script_version: null,
           source_asset_id: "00000000-0000-4000-8000-000000000002",
           status: "TRANSCRIBING",
           version: 3,
+        }) as unknown as Row | null,
+      run: async () => ({ meta: { changes: 1 }, results: [] }),
+    };
+  }
+
+  async batch() {
+    return [];
+  }
+}
+
+class TranslationClaimDatabase implements LeaseDatabase {
+  prepare(sql: string): LeaseStatement {
+    return {
+      bind: () => this.prepare(sql),
+      first: async <Row extends Record<string, unknown>>() =>
+        ({
+          id: "00000000-0000-4000-8000-000000000001",
+          ingest_result_json: null,
+          job_type: "LOCALIZE",
+          lease_until: "2026-08-07T00:01:00Z",
+          metadata_json: null,
+          pipeline_lineage_json: JSON.stringify([
+            [
+              {
+                artifactRef: "transcript-01.json",
+                byteCount: 512,
+                kind: "TRANSCRIPT",
+                sha256: "a".repeat(64),
+                toolVersion: "whisper.cpp-1.7.4",
+              },
+            ],
+          ]),
+          rights_metadata_json: JSON.stringify({
+            allowedProcessors: ["GOOGLE_GEMINI"],
+            evidenceHash: "c".repeat(64),
+          }),
+          script_hash: null,
+          script_version: null,
+          source_asset_id: "00000000-0000-4000-8000-000000000002",
+          status: "TRANSLATING",
+          version: 4,
         }) as unknown as Row | null,
       run: async () => ({ meta: { changes: 1 }, results: [] }),
     };
@@ -90,6 +134,7 @@ describe("pipeline artifact lineage", () => {
           kind: "NORMALIZED_MEDIA",
           sha256: "a".repeat(64),
         },
+        state: "TRANSCRIBING",
       },
       state: "TRANSCRIBING",
     });
@@ -122,5 +167,24 @@ describe("pipeline artifact lineage", () => {
     const update = database.batches[0]?.[0];
     expect(update?.sql).toContain("pipeline_lineage_json");
     expect(update?.values).toContain(JSON.stringify([artifact]));
+  });
+
+  it("projects only transcript lineage and explicit provider permission for translation", async () => {
+    const claim = await new LeaseService(new TranslationClaimDatabase(), () => "t".repeat(43)).claim({
+      agentId: "agent-a",
+      leaseExpiresAtUtc: "2026-08-07T00:01:00Z",
+      nowUtc: "2026-08-07T00:00:00Z",
+      supportedJobTypes: ["LOCALIZE"],
+      supportedStates: ["TRANSLATING"],
+    });
+
+    expect(claim).toMatchObject({
+      pipelineInput: {
+        googleProcessingAllowed: true,
+        state: "TRANSLATING",
+        transcript: { artifactRef: "transcript-01.json", kind: "TRANSCRIPT" },
+      },
+    });
+    expect(JSON.stringify(claim)).not.toContain("evidenceHash");
   });
 });

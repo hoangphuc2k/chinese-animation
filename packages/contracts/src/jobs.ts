@@ -73,13 +73,59 @@ export const PipelineArtifact = z
   })
   .strict();
 export type PipelineArtifact = z.infer<typeof PipelineArtifact>;
-export const PipelineClaimInput = z
-  .object({
-    normalizedMedia: PipelineArtifact.refine((artifact) => artifact.kind === "NORMALIZED_MEDIA", {
-      message: "transcription input must be normalized media",
-    }),
-  })
-  .strict();
+function artifactOfKind(kind: PipelineArtifactKind) {
+  return PipelineArtifact.refine((artifact) => artifact.kind === kind, {
+    message: `pipeline input artifact must have kind ${kind}`,
+  });
+}
+
+export const PipelineClaimInput = z.discriminatedUnion("state", [
+  z
+    .object({
+      normalizedMedia: artifactOfKind("NORMALIZED_MEDIA"),
+      state: z.literal("TRANSCRIBING"),
+    })
+    .strict(),
+  z
+    .object({
+      googleProcessingAllowed: z.literal(true),
+      state: z.literal("TRANSLATING"),
+      transcript: artifactOfKind("TRANSCRIPT"),
+    })
+    .strict(),
+  z
+    .object({
+      script: artifactOfKind("SCRIPT"),
+      scriptSha256: Sha256,
+      scriptVersion: z.number().int().positive(),
+      state: z.literal("GENERATING_VOICE"),
+    })
+    .strict(),
+  z
+    .object({
+      script: artifactOfKind("SCRIPT"),
+      state: z.literal("MIXING"),
+      voice: artifactOfKind("VOICE"),
+    })
+    .strict(),
+  z
+    .object({
+      mixedAudio: artifactOfKind("MIXED_AUDIO"),
+      normalizedMedia: artifactOfKind("NORMALIZED_MEDIA"),
+      scriptSha256: Sha256,
+      scriptVersion: z.number().int().positive(),
+      state: z.literal("RENDERING"),
+      subtitles: artifactOfKind("SUBTITLES"),
+    })
+    .strict(),
+  z
+    .object({
+      render: artifactOfKind("RENDER"),
+      state: z.literal("READY_FOR_PREVIEW"),
+      subtitles: artifactOfKind("SUBTITLES"),
+    })
+    .strict(),
+]);
 export type PipelineClaimInput = z.infer<typeof PipelineClaimInput>;
 const outputKindsByTransition = {
   "EXTRACTING_AUDIO->TRANSCRIBING": ["EXTRACTED_AUDIO"],
@@ -117,16 +163,30 @@ export const ClaimJobResponse = z
         message: "only queued or ingesting import claims may include import input",
       });
     }
-    if (value.state === "TRANSCRIBING" && !value.pipelineInput) {
+    const pipelineStates = new Set([
+      "TRANSCRIBING",
+      "TRANSLATING",
+      "GENERATING_VOICE",
+      "MIXING",
+      "RENDERING",
+      "READY_FOR_PREVIEW",
+    ]);
+    if (pipelineStates.has(value.state) && !value.pipelineInput) {
       context.addIssue({
         code: "custom",
-        message: "transcription claims require normalized media input",
+        message: "pipeline claims require state-specific input",
       });
     }
-    if (value.state !== "TRANSCRIBING" && value.pipelineInput) {
+    if (value.pipelineInput && value.pipelineInput.state !== value.state) {
       context.addIssue({
         code: "custom",
-        message: "normalized media input is valid only for transcription claims",
+        message: "pipeline input state must match the claimed job state",
+      });
+    }
+    if (!pipelineStates.has(value.state) && value.pipelineInput) {
+      context.addIssue({
+        code: "custom",
+        message: "pipeline input is valid only for executable pipeline claims",
       });
     }
   });
