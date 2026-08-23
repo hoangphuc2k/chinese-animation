@@ -124,6 +124,7 @@ export function createAgentRoutes(options: AgentRoutesOptions): Hono<{ Variables
       };
       if (input.data.ingestResult) completion.ingestResult = input.data.ingestResult;
       if (input.data.pipelineArtifacts) completion.pipelineArtifacts = input.data.pipelineArtifacts;
+      if (input.data.preview) completion.preview = input.data.preview;
       await options.leaseService.complete(completion);
       return new Response(null, { status: 204 });
     } catch (error) {

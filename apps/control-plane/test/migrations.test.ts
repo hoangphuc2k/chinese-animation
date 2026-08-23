@@ -79,6 +79,7 @@ describe("D1 migrations", () => {
 
     const jobColumns = queryRows<{ name: string }>(database, "PRAGMA table_info(jobs)").map((column) => column.name);
     expect(jobColumns).toContain("version");
+    expect(jobColumns).toContain("preview_descriptor_json");
     const idempotencyColumns = queryRows<{ name: string }>(database, "PRAGMA table_info(idempotency_records)").map(
       (column) => column.name,
     );

@@ -83,6 +83,12 @@ export const PipelineClaimInput = z.discriminatedUnion("state", [
   z
     .object({
       normalizedMedia: artifactOfKind("NORMALIZED_MEDIA"),
+      state: z.literal("EXTRACTING_AUDIO"),
+    })
+    .strict(),
+  z
+    .object({
+      extractedAudio: artifactOfKind("EXTRACTED_AUDIO"),
       state: z.literal("TRANSCRIBING"),
     })
     .strict(),
@@ -163,7 +169,15 @@ export const ClaimJobResponse = z
         message: "only queued or ingesting import claims may include import input",
       });
     }
+    const needsIngestResult = value.jobType === "IMPORT" && value.state === "PROBING";
+    if (needsIngestResult !== (value.ingestResult !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "only import probing claims require sanitized ingest results",
+      });
+    }
     const pipelineStates = new Set([
+      "EXTRACTING_AUDIO",
       "TRANSCRIBING",
       "TRANSLATING",
       "GENERATING_VOICE",
@@ -193,6 +207,18 @@ export const ClaimJobResponse = z
 export const HeartbeatRequest = z
   .object({ jobVersion: z.number().int().positive(), leaseToken: z.string().min(32) })
   .strict();
+export const PreviewDescriptor = z
+  .object({
+    expiresAtUtc: IsoUtc,
+    renderSha256: Sha256,
+    token: z
+      .string()
+      .min(32)
+      .max(128)
+      .regex(/^[A-Za-z0-9_-]+$/),
+  })
+  .strict();
+export type PreviewDescriptor = z.infer<typeof PreviewDescriptor>;
 export const CompleteStepRequest = z
   .object({
     leaseToken: z.string().min(32),
@@ -204,6 +230,7 @@ export const CompleteStepRequest = z
     bytesWritten: z.number().int().nonnegative().safe().optional(),
     ingestResult: IngestResult.optional(),
     pipelineArtifacts: z.array(PipelineArtifact).min(1).max(100).optional(),
+    preview: PreviewDescriptor.optional(),
     segmentIds: z.array(SegmentId).max(10000).optional(),
   })
   .strict()
@@ -227,6 +254,14 @@ export const CompleteStepRequest = z
           message: "pipeline artifacts are not valid for this processing transition",
         });
       }
+    }
+    const isPreviewCompletion =
+      value.expectedState === "READY_FOR_PREVIEW" && value.state === "WAITING_PUBLISH_APPROVAL";
+    if (isPreviewCompletion !== (value.preview !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "preview descriptors require the canonical preview completion transition",
+      });
     }
   });
 export const DashboardInboxResponse = z

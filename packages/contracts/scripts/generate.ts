@@ -73,10 +73,16 @@ const agentSchemas = {
     },
     additionalProperties: false,
   },
-  TranscriptionPipelineInput: {
+  ExtractionPipelineInput: {
     type: "object",
     required: ["normalizedMedia", "state"],
-    properties: { normalizedMedia: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "TRANSCRIBING" } },
+    properties: { normalizedMedia: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "EXTRACTING_AUDIO" } },
+    additionalProperties: false,
+  },
+  TranscriptionPipelineInput: {
+    type: "object",
+    required: ["extractedAudio", "state"],
+    properties: { extractedAudio: { $ref: "#/components/schemas/PipelineArtifact" }, state: { const: "TRANSCRIBING" } },
     additionalProperties: false,
   },
   TranslationPipelineInput: {
@@ -111,6 +117,7 @@ const agentSchemas = {
   },
   PipelineClaimInput: {
     oneOf: [
+      { $ref: "#/components/schemas/ExtractionPipelineInput" },
       { $ref: "#/components/schemas/TranscriptionPipelineInput" },
       { $ref: "#/components/schemas/TranslationPipelineInput" },
       { $ref: "#/components/schemas/VoicePipelineInput" },
@@ -119,6 +126,16 @@ const agentSchemas = {
       { $ref: "#/components/schemas/PreviewPipelineInput" },
     ],
     discriminator: { propertyName: "state" },
+  },
+  PreviewDescriptor: {
+    type: "object",
+    required: ["expiresAtUtc", "renderSha256", "token"],
+    properties: {
+      expiresAtUtc: { type: "string", format: "date-time" },
+      renderSha256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      token: { type: "string", minLength: 32, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$" },
+    },
+    additionalProperties: false,
   },
   ClaimJobResponse: {
     type: "object",
@@ -150,6 +167,7 @@ const agentSchemas = {
       bytesWritten: { type: "integer", minimum: 0 },
       ingestResult: { $ref: "#/components/schemas/IngestResult" },
       pipelineArtifacts: { type: "array", minItems: 1, maxItems: 100, items: { $ref: "#/components/schemas/PipelineArtifact" } },
+      preview: { $ref: "#/components/schemas/PreviewDescriptor" },
       segmentIds: { type: "array", items: { type: "string", format: "uuid" } },
     },
     additionalProperties: false,
@@ -168,7 +186,11 @@ const pyWithHeartbeat = pyWithSupportedStates.replace(
   "class CompleteStepRequest",
   "class HeartbeatRequest(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    jobVersion: int = Field(gt=0)\n    leaseToken: str = Field(min_length=32)\n\n\nclass CompleteStepRequest",
 );
-const pyWithPipelineArtifacts = pyWithHeartbeat
+const pyWithPreview = pyWithHeartbeat.replace(
+  "class CompleteStepRequest",
+  "class PreviewDescriptor(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    expiresAtUtc: str\n    renderSha256: str = Field(pattern=r\"^[a-f0-9]{64}$\")\n    token: str = Field(min_length=32, max_length=128, pattern=r\"^[A-Za-z0-9_-]+$\")\n\n\nclass CompleteStepRequest",
+);
+const pyWithPipelineArtifacts = pyWithPreview
   .replace(
     'JobType = Literal["IMPORT", "DISCOVERY", "LOCALIZE", "RENDER", "PUBLISH", "DELETE_EXPIRED"]',
     'JobType = Literal["IMPORT", "DISCOVERY", "LOCALIZE", "RENDER", "PUBLISH", "DELETE_EXPIRED"]\nArtifactKind = Literal["EXTRACTED_AUDIO", "MIXED_AUDIO", "NORMALIZED_MEDIA", "OCR_TRACK", "RENDER", "SCRIPT", "SUBTITLES", "TRANSCRIPT", "VOICE"]',
@@ -179,11 +201,20 @@ const pyWithPipelineArtifacts = pyWithHeartbeat
   )
   .replace(
     "    ingestResult: IngestResult | None = None\n    segmentIds: list[str] | None = None\n",
-    "    ingestResult: IngestResult | None = None\n    pipelineArtifacts: list[PipelineArtifact] | None = None\n    segmentIds: list[str] | None = None\n",
+    "    ingestResult: IngestResult | None = None\n    pipelineArtifacts: list[PipelineArtifact] | None = None\n    preview: PreviewDescriptor | None = None\n    segmentIds: list[str] | None = None\n",
   )
   .replace(
     "    importInput: ImportInput | None = None\n",
     "    importInput: ImportInput | None = None\n    ingestResult: IngestResult | None = None\n    pipelineInput: PipelineClaimInput | None = None\n",
+  );
+const pyWithExtractionPipeline = pyWithPipelineArtifacts
+  .replace(
+    "class TranscriptionPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    normalizedMedia: PipelineArtifact\n    state: Literal[\"TRANSCRIBING\"]",
+    "class ExtractionPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    normalizedMedia: PipelineArtifact\n    state: Literal[\"EXTRACTING_AUDIO\"]\n\n\nclass TranscriptionPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    extractedAudio: PipelineArtifact\n    state: Literal[\"TRANSCRIBING\"]",
+  )
+  .replace(
+    "Union[TranscriptionPipelineInput, TranslationPipelineInput",
+    "Union[ExtractionPipelineInput, TranscriptionPipelineInput, TranslationPipelineInput",
   );
 
 await mkdir(dirname(openapiPath), { recursive: true });
@@ -207,7 +238,7 @@ try {
 }
 schemaArtifact.components.schemas = { ...schemaArtifact.components.schemas, ...agentSchemas };
 const requiredSchemas = [
-  "ApiError", "ApprovePublishRequest", "ApproveScriptRequest", "ClaimJobRequest", "ClaimJobResponse", "CompleteStepRequest", "ImportInput", "IngestResult", "PipelineArtifact", "PipelineClaimInput", "TechnicalMetadata",
+  "ApiError", "ApprovePublishRequest", "ApproveScriptRequest", "ClaimJobRequest", "ClaimJobResponse", "CompleteStepRequest", "ExtractionPipelineInput", "ImportInput", "IngestResult", "PipelineArtifact", "PipelineClaimInput", "PreviewDescriptor", "TechnicalMetadata",
   "CreateImportRequest", "DashboardInboxResponse",
   "DestinationState", "HeartbeatRequest", "ProcessingState", "RenderReviewResponse",
   "SegmentReviewResponse", "SourceState",
@@ -229,5 +260,5 @@ for (const [schemaName, fields] of Object.entries(requiredJobFields)) {
 }
 await writeFile(openapiPath, `${JSON.stringify(schemaArtifact, null, 2)}\n`);
 await writeFile(tsPath, ts);
-await writeFile(pyPath, pyWithPipelineArtifacts);
+await writeFile(pyPath, pyWithExtractionPipeline);
 console.log("Generated OpenAPI, TypeScript and Python contract models.");

@@ -1,4 +1,4 @@
-import { ImportInput, IngestResult, PipelineArtifact, PipelineClaimInput } from "../../../../packages/contracts/src/jobs";
+import { ImportInput, IngestResult, PipelineArtifact, PipelineClaimInput, type PreviewDescriptor } from "../../../../packages/contracts/src/jobs";
 import type { JobType, ProcessingState } from "../../../../packages/contracts/src/states";
 
 import { assertJobTransition } from "../domain/job-state-machine";
@@ -79,6 +79,7 @@ export interface CompleteLeaseInput {
   step: string;
   ingestResult?: IngestResult;
   pipelineArtifacts?: readonly PipelineArtifact[];
+  preview?: PreviewDescriptor;
 }
 
 export class LeaseInvalidError extends Error {
@@ -117,9 +118,9 @@ function ingestResultFromClaim(row: ClaimedJobRow): IngestResult | undefined {
   return IngestResult.parse(JSON.parse(row.ingest_result_json));
 }
 
-function transcriptionInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
+function extractionInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
   const ingestResult = ingestResultFromClaim(row);
-  if (!ingestResult) throw new Error("Transcription job is missing normalized-media lineage.");
+  if (!ingestResult) throw new Error("Audio extraction job is missing normalized-media lineage.");
   return PipelineClaimInput.parse({
     normalizedMedia: {
       artifactRef: "normalized-media",
@@ -128,7 +129,7 @@ function transcriptionInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
       sha256: ingestResult.normalizedHash,
       toolVersion: "ffmpeg-normalize-v1",
     },
-    state: "TRANSCRIBING",
+    state: "EXTRACTING_AUDIO",
   });
 }
 
@@ -176,8 +177,11 @@ function exactScript(row: ClaimedJobRow, artifacts: readonly PipelineArtifact[])
 }
 
 function pipelineInputFromClaim(row: ClaimedJobRow): PipelineClaimInput {
-  if (row.status === "TRANSCRIBING") return transcriptionInputFromClaim(row);
+  if (row.status === "EXTRACTING_AUDIO") return extractionInputFromClaim(row);
   const artifacts = pipelineArtifactsFromClaim(row);
+  if (row.status === "TRANSCRIBING") {
+    return PipelineClaimInput.parse({ extractedAudio: latestArtifact(artifacts, "EXTRACTED_AUDIO"), state: row.status });
+  }
   if (row.status === "TRANSLATING") {
     return PipelineClaimInput.parse({
       googleProcessingAllowed: googleProcessingAllowed(row),
@@ -263,7 +267,7 @@ export class LeaseService {
       leaseToken,
       state: claimed.status,
     };
-    if (["TRANSCRIBING", "TRANSLATING", "GENERATING_VOICE", "MIXING", "RENDERING", "READY_FOR_PREVIEW"].includes(claimed.status)) {
+    if (["EXTRACTING_AUDIO", "TRANSCRIBING", "TRANSLATING", "GENERATING_VOICE", "MIXING", "RENDERING", "READY_FOR_PREVIEW"].includes(claimed.status)) {
       return { ...lease, pipelineInput: pipelineInputFromClaim(claimed) };
     }
     if (claimed.job_type !== "IMPORT") return lease;
@@ -309,6 +313,17 @@ export class LeaseService {
     }
     const ingestResultJson = input.ingestResult ? JSON.stringify(input.ingestResult) : null;
     const pipelineArtifactsJson = input.pipelineArtifacts ? JSON.stringify(input.pipelineArtifacts) : null;
+    const previewJson = input.preview ? JSON.stringify(input.preview) : null;
+    const isPreviewCompletion = input.expectedState === "READY_FOR_PREVIEW" && input.nextState === "WAITING_PUBLISH_APPROVAL";
+    if (isPreviewCompletion !== (input.preview !== undefined)) {
+      throw new Error("The canonical preview transition requires exactly one preview descriptor.");
+    }
+    if (input.preview) {
+      const lifetimeMs = new Date(input.preview.expiresAtUtc).getTime() - new Date(input.nowUtc).getTime();
+      if (!Number.isFinite(lifetimeMs) || lifetimeMs <= 0 || lifetimeMs > 300_000) {
+        throw new Error("Preview descriptors require the canonical transition and a maximum five-minute lifetime.");
+      }
+    }
     const detailsJson = JSON.stringify({
       ...(input.ingestResult ? { normalizedHash: input.ingestResult.normalizedHash } : {}),
       ...(input.pipelineArtifacts
@@ -316,11 +331,12 @@ export class LeaseService {
             artifacts: input.pipelineArtifacts.map(({ byteCount, kind, sha256, toolVersion }) => ({ byteCount, kind, sha256, toolVersion })),
           }
         : {}),
+      ...(input.preview ? { previewExpiresAtUtc: input.preview.expiresAtUtc, renderSha256: input.preview.renderSha256 } : {}),
     });
     const results = await this.database.batch([
       this.database
         .prepare(
-          "UPDATE jobs SET status = ?, step = ?, ingest_result_json = COALESCE(?, ingest_result_json), pipeline_lineage_json = CASE WHEN ? IS NULL THEN pipeline_lineage_json ELSE json_insert(COALESCE(pipeline_lineage_json, '[]'), '$[#]', json(?)) END, lease_owner = NULL, lease_token_hash = NULL, lease_until = NULL, version = version + 1, updated_at = ? WHERE id = ? AND lease_owner = ? AND lease_token_hash = ? AND lease_until > ? AND status = ? AND version = ? AND (? IS NULL OR job_type = 'IMPORT')",
+          "UPDATE jobs SET status = ?, step = ?, ingest_result_json = COALESCE(?, ingest_result_json), pipeline_lineage_json = CASE WHEN ? IS NULL THEN pipeline_lineage_json ELSE json_insert(COALESCE(pipeline_lineage_json, '[]'), '$[#]', json(?)) END, preview_descriptor_json = COALESCE(?, preview_descriptor_json), lease_owner = NULL, lease_token_hash = NULL, lease_until = NULL, version = version + 1, updated_at = ? WHERE id = ? AND lease_owner = ? AND lease_token_hash = ? AND lease_until > ? AND status = ? AND version = ? AND (? IS NULL OR job_type = 'IMPORT') AND (? IS NULL OR EXISTS (SELECT 1 FROM json_tree(jobs.pipeline_lineage_json) AS artifact WHERE artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'RENDER' AND json_extract(artifact.value, '$.sha256') = ?))",
         )
         .bind(
           input.nextState,
@@ -328,6 +344,7 @@ export class LeaseService {
           ingestResultJson,
           pipelineArtifactsJson,
           pipelineArtifactsJson,
+          previewJson,
           input.nowUtc,
           input.jobId,
           input.agentId,
@@ -336,6 +353,8 @@ export class LeaseService {
           input.expectedState,
           input.jobVersion,
           ingestResultJson,
+          input.preview?.renderSha256 ?? null,
+          input.preview?.renderSha256 ?? null,
         ),
       this.database
         .prepare(

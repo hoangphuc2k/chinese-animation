@@ -15,12 +15,12 @@ def claim(state: str = "TRANSCRIBING") -> ClaimJobResponse:
             "leaseExpiresAtUtc": "2026-08-04T00:05:00Z",
             "leaseToken": "t" * 43,
             "pipelineInput": {
-                "normalizedMedia": {
-                    "artifactRef": "normalized-media",
+                "extractedAudio": {
+                    "artifactRef": "audio.wav",
                     "byteCount": 10,
-                    "kind": "NORMALIZED_MEDIA",
+                    "kind": "EXTRACTED_AUDIO",
                     "sha256": "a" * 64,
-                    "toolVersion": "ffmpeg-normalize-v1",
+                    "toolVersion": "ffmpeg-pcm16-v1",
                 },
                 "state": "TRANSCRIBING",
             },

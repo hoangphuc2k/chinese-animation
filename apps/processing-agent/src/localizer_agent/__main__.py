@@ -10,9 +10,10 @@ from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
 from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
-from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, RenderHandler, TranslationHandler, VoiceHandler
+from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, PreviewHandler, RenderHandler, TranslationHandler, VoiceHandler
 from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
-from localizer_agent.pipeline.transcription_stage import TranscriptionHandler
+from localizer_agent.pipeline.transcription_stage import AudioExtractionHandler, ProbeHandler, TranscriptionHandler
+from localizer_agent.preview.registry import PreviewRegistry
 from localizer_agent.structured_logging import create_logger
 from localizer_agent.supervisor import ImportSupervisor
 from localizer_agent.speech.audio import AzureVoiceOperations
@@ -56,6 +57,20 @@ async def run() -> None:
             binary_version=config.whisper_binary_version,
             expected_model_sha256=config.whisper_model_sha256,
         )
+        handlers["PROBING"] = ProbeHandler(
+            client,
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+        )
+        job_types_by_state["PROBING"] = ["IMPORT"]
+        handlers["EXTRACTING_AUDIO"] = AudioExtractionHandler(
+            client,
+            workspace_manager,
+            whisper,
+            config_version="ffmpeg-pcm16-v1",
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+            tool_version="ffmpeg-pcm16-v1",
+        )
+        job_types_by_state["EXTRACTING_AUDIO"] = ["IMPORT", "LOCALIZE"]
         handlers["TRANSCRIBING"] = TranscriptionHandler(
             client,
             workspace_manager,
@@ -116,6 +131,13 @@ async def run() -> None:
             tool_version="ffmpeg-h264-aac-v1",
         )
         job_types_by_state["RENDERING"] = ["IMPORT", "LOCALIZE", "RENDER"]
+    handlers["READY_FOR_PREVIEW"] = PreviewHandler(
+        client,
+        workspace_manager,
+        PreviewRegistry(config.workspace_root / "preview-registry.json"),
+        heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+    )
+    job_types_by_state["READY_FOR_PREVIEW"] = ["IMPORT", "LOCALIZE", "RENDER"]
     supervisor = ProcessingSupervisor(
         client,
         handlers,

@@ -45,12 +45,12 @@ def transcription_claim() -> ClaimJobResponse:
             "leaseExpiresAtUtc": "2026-08-04T00:05:00Z",
             "leaseToken": "t" * 43,
             "pipelineInput": {
-                "normalizedMedia": {
-                    "artifactRef": "normalized-media",
+                "extractedAudio": {
+                    "artifactRef": "audio.wav",
                     "byteCount": 10,
-                    "kind": "NORMALIZED_MEDIA",
+                    "kind": "EXTRACTED_AUDIO",
                     "sha256": "a" * 64,
-                    "toolVersion": "ffmpeg-normalize-v1",
+                    "toolVersion": "ffmpeg-pcm16-v1",
                 },
                 "state": "TRANSCRIBING",
             },
@@ -133,7 +133,7 @@ def test_client_accepts_a_state_aware_pipeline_claim_for_declared_job_types() ->
 
     received, transport = asyncio.run(scenario())
     assert received.pipelineInput is not None
-    assert received.pipelineInput.normalizedMedia.kind == "NORMALIZED_MEDIA"
+    assert received.pipelineInput.extractedAudio.kind == "EXTRACTED_AUDIO"
     assert json.loads(transport.calls[0][3] or b"{}") == {"supportedJobTypes": ["IMPORT"], "supportedStates": ["TRANSCRIBING"]}
 
 

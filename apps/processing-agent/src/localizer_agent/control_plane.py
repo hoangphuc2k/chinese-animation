@@ -128,8 +128,12 @@ class AgentControlPlaneClient:
         if needs_import_input != (claim.importInput is not None):
             return False
         pipeline_input = claim.pipelineInput
-        if claim.state == "TRANSCRIBING":
+        if claim.state == "PROBING":
+            return claim.ingestResult is not None and pipeline_input is None
+        if claim.state == "EXTRACTING_AUDIO":
             return pipeline_input is not None and pipeline_input.state == claim.state and pipeline_input.normalizedMedia.kind == "NORMALIZED_MEDIA"
+        if claim.state == "TRANSCRIBING":
+            return pipeline_input is not None and pipeline_input.state == claim.state and pipeline_input.extractedAudio.kind == "EXTRACTED_AUDIO"
         if claim.state == "TRANSLATING":
             return pipeline_input is not None and pipeline_input.state == claim.state and pipeline_input.googleProcessingAllowed and pipeline_input.transcript.kind == "TRANSCRIPT"
         if claim.state == "GENERATING_VOICE":

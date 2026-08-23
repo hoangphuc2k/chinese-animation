@@ -26,6 +26,97 @@ class WhisperOperations(Protocol):
     def transcribe(self, audio_path: Path, output_prefix: Path) -> TranscriptArtifact: ...
 
 
+class ProbeHandler:
+    def __init__(self, client: TranscriptionClient, *, heartbeat_interval_seconds: float) -> None:
+        self._client = client
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+
+    async def handle(self, claim: ClaimJobResponse) -> None:
+        if claim.state != "PROBING" or claim.ingestResult is None:
+            raise RuntimeError("Probe handler received an invalid state-specific claim.")
+        has_audio = claim.ingestResult.technicalMetadata.hasAudio
+        async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
+            guard.assert_active()
+            await self._client.complete(
+                claim,
+                CompleteStepRequest(
+                    expectedState="PROBING",
+                    jobVersion=claim.jobVersion,
+                    leaseToken=claim.leaseToken,
+                    state="EXTRACTING_AUDIO" if has_audio else "FAILED",
+                    step="probe_validated" if has_audio else "audio_track_missing",
+                ),
+            )
+
+
+class AudioExtractionHandler:
+    def __init__(
+        self,
+        client: TranscriptionClient,
+        workspace_manager: JobWorkspaceManager,
+        whisper: WhisperOperations,
+        *,
+        config_version: str,
+        heartbeat_interval_seconds: float,
+        tool_version: str,
+    ) -> None:
+        if not config_version or not tool_version:
+            raise ValueError("Audio extraction configuration and tool versions are required.")
+        self._client = client
+        self._config_version = config_version
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._tool_version = tool_version
+        self._whisper = whisper
+        self._workspace_manager = workspace_manager
+
+    async def handle(self, claim: ClaimJobResponse) -> None:
+        pipeline_input = claim.pipelineInput
+        if claim.state != "EXTRACTING_AUDIO" or pipeline_input is None or pipeline_input.state != "EXTRACTING_AUDIO":
+            raise RuntimeError("Audio extraction handler received an invalid state-specific claim.")
+        workspace = self._workspace_manager.open(claim.jobId)
+        normalized = ArtifactRecord.from_path(
+            workspace.normalized_path,
+            kind="NORMALIZED_MEDIA",
+            tool_version=pipeline_input.normalizedMedia.toolVersion,
+        )
+        if normalized.sha256 != pipeline_input.normalizedMedia.sha256 or normalized.byte_count != pipeline_input.normalizedMedia.byteCount:
+            raise RuntimeError("Normalized media does not match the audio-extraction lineage.")
+        key = StageKey.for_input(claim.jobId, claim.jobVersion, claim.state, normalized.sha256, self._config_version)
+
+        async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
+            result = await asyncio.to_thread(self._run_stage, workspace, key)
+            guard.assert_active()
+            artifact = result.artifact
+            await self._client.complete(
+                claim,
+                CompleteStepRequest(
+                    expectedState="EXTRACTING_AUDIO",
+                    jobVersion=claim.jobVersion,
+                    leaseToken=claim.leaseToken,
+                    pipelineArtifacts=[
+                        {
+                            "artifactRef": artifact.path.name,
+                            "byteCount": artifact.byte_count,
+                            "kind": "EXTRACTED_AUDIO",
+                            "sha256": artifact.sha256,
+                            "toolVersion": artifact.tool_version,
+                        }
+                    ],
+                    state="TRANSCRIBING",
+                    step="audio_extracted",
+                ),
+            )
+
+    def _run_stage(self, workspace: JobWorkspace, key: StageKey) -> StageResult:
+        return StageRunner(workspace).run(
+            key,
+            execute=lambda candidate: self._whisper.extract_pcm(workspace.normalized_path, candidate),
+            kind="EXTRACTED_AUDIO",
+            suffix=".wav",
+            tool_version=self._tool_version,
+        )
+
+
 class TranscriptionHandler:
     def __init__(
         self,
@@ -49,20 +140,21 @@ class TranscriptionHandler:
     async def handle(self, claim: ClaimJobResponse) -> None:
         if claim.state != "TRANSCRIBING" or claim.pipelineInput is None:
             raise RuntimeError("Transcription handler received an invalid state-specific claim.")
-        expected = claim.pipelineInput.normalizedMedia
+        expected = claim.pipelineInput.extractedAudio
         workspace = self._workspace_manager.open(claim.jobId)
-        normalized = await asyncio.to_thread(
+        audio_path = workspace.root / "artifacts" / expected.artifactRef
+        extracted = await asyncio.to_thread(
             ArtifactRecord.from_path,
-            workspace.normalized_path,
-            kind="NORMALIZED_MEDIA",
+            audio_path,
+            kind="EXTRACTED_AUDIO",
             tool_version=expected.toolVersion,
         )
-        if normalized.sha256 != expected.sha256 or normalized.byte_count != expected.byteCount:
-            raise RuntimeError("Normalized media does not match the control-plane lineage.")
-        key = StageKey.for_input(claim.jobId, claim.jobVersion, claim.state, normalized.sha256, self._config_version)
+        if extracted.sha256 != expected.sha256 or extracted.byte_count != expected.byteCount:
+            raise RuntimeError("Extracted audio does not match the control-plane lineage.")
+        key = StageKey.for_input(claim.jobId, claim.jobVersion, claim.state, extracted.sha256, self._config_version)
 
         async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
-            result, transcript = await asyncio.to_thread(self._run_stage, workspace, key)
+            result, transcript = await asyncio.to_thread(self._run_stage, workspace, key, audio_path)
             guard.assert_active()
             artifact = result.artifact
             await self._client.complete(
@@ -86,15 +178,13 @@ class TranscriptionHandler:
                 ),
             )
 
-    def _run_stage(self, workspace: JobWorkspace, key: StageKey) -> tuple[StageResult, TranscriptArtifact]:
-        pcm_path = workspace.root / f".{key.value}.pcm.wav"
+    def _run_stage(self, workspace: JobWorkspace, key: StageKey, audio_path: Path) -> tuple[StageResult, TranscriptArtifact]:
         output_prefix = workspace.root / f".{key.value}.whisper"
         transcript: TranscriptArtifact | None = None
 
         def execute(candidate: Path) -> None:
             nonlocal transcript
-            self._whisper.extract_pcm(workspace.normalized_path, pcm_path)
-            transcript = self._whisper.transcribe(pcm_path, output_prefix)
+            transcript = self._whisper.transcribe(audio_path, output_prefix)
             payload = {
                 "binaryVersion": transcript.binary_version,
                 "modelSha256": transcript.model_sha256,
@@ -130,5 +220,4 @@ class TranscriptionHandler:
                 )
             return result, transcript
         finally:
-            pcm_path.unlink(missing_ok=True)
             output_prefix.with_suffix(".json").unlink(missing_ok=True)

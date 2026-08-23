@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 from localizer_agent.generated.models import ClaimJobResponse, CompleteStepRequest, PipelineArtifact
 from localizer_agent.lease import LeaseGuard
@@ -16,6 +17,7 @@ from localizer_agent.localization.validator import ScriptSegment, validate_scrip
 from localizer_agent.pipeline.approval_gate import ApprovalSnapshot, StaleApprovalError, require_exact_approval
 from localizer_agent.pipeline.lineage import ArtifactRecord, StageKey
 from localizer_agent.pipeline.runner import StageResult, StageRunner
+from localizer_agent.preview.registry import PreviewRegistry
 from localizer_agent.render.ffmpeg import RenderInputs
 from localizer_agent.speech.audio import TimingReviewRequired
 from localizer_agent.subtitles.writer import write_srt
@@ -448,3 +450,55 @@ class RenderHandler:
             suffix=".mp4",
             tool_version=self._tool_version,
         )
+
+
+class PreviewHandler:
+    def __init__(
+        self,
+        client: StageClient,
+        workspace_manager: JobWorkspaceManager,
+        registry: PreviewRegistry,
+        *,
+        heartbeat_interval_seconds: float,
+        now_utc: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._client = client
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._now_utc = now_utc or (lambda: datetime.now(UTC))
+        self._registry = registry
+        self._workspace_manager = workspace_manager
+
+    async def handle(self, claim: ClaimJobResponse) -> None:
+        pipeline_input = claim.pipelineInput
+        if claim.state != "READY_FOR_PREVIEW" or pipeline_input is None or pipeline_input.state != "READY_FOR_PREVIEW":
+            raise RuntimeError("Preview handler received an invalid state-specific claim.")
+        workspace = self._workspace_manager.open(claim.jobId)
+        render = _artifact_path(workspace, pipeline_input.render)
+        _artifact_path(workspace, pipeline_input.subtitles)
+        now = self._now_utc()
+        if now.tzinfo is None:
+            raise ValueError("Preview registration time must include a timezone.")
+        expires_at = now.astimezone(UTC) + timedelta(minutes=5)
+
+        async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
+            token = self._registry.register(
+                claim.jobId,
+                f"{claim.jobId}/artifacts/{render.name}",
+                expires_at,
+            )
+            guard.assert_active()
+            await self._client.complete(
+                claim,
+                CompleteStepRequest(
+                    expectedState="READY_FOR_PREVIEW",
+                    jobVersion=claim.jobVersion,
+                    leaseToken=claim.leaseToken,
+                    preview={
+                        "expiresAtUtc": expires_at.isoformat().replace("+00:00", "Z"),
+                        "renderSha256": pipeline_input.render.sha256,
+                        "token": token,
+                    },
+                    state="WAITING_PUBLISH_APPROVAL",
+                    step="preview_registered",
+                ),
+            )

@@ -61,9 +61,15 @@ class PipelineArtifact(BaseModel):
     toolVersion: str = Field(min_length=1, max_length=160)
 
 
-class TranscriptionPipelineInput(BaseModel):
+class ExtractionPipelineInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     normalizedMedia: PipelineArtifact
+    state: Literal["EXTRACTING_AUDIO"]
+
+
+class TranscriptionPipelineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    extractedAudio: PipelineArtifact
     state: Literal["TRANSCRIBING"]
 
 
@@ -106,7 +112,7 @@ class PreviewPipelineInput(BaseModel):
     subtitles: PipelineArtifact
 
 
-PipelineClaimInput = Annotated[Union[TranscriptionPipelineInput, TranslationPipelineInput, VoicePipelineInput, MixingPipelineInput, RenderingPipelineInput, PreviewPipelineInput], Field(discriminator="state")]
+PipelineClaimInput = Annotated[Union[ExtractionPipelineInput, TranscriptionPipelineInput, TranslationPipelineInput, VoicePipelineInput, MixingPipelineInput, RenderingPipelineInput, PreviewPipelineInput], Field(discriminator="state")]
 
 
 class ClaimJobResponse(BaseModel):
@@ -129,6 +135,13 @@ class HeartbeatRequest(BaseModel):
     leaseToken: str = Field(min_length=32)
 
 
+class PreviewDescriptor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expiresAtUtc: str
+    renderSha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    token: str = Field(min_length=32, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
 class CompleteStepRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     leaseToken: str = Field(min_length=32)
@@ -140,4 +153,5 @@ class CompleteStepRequest(BaseModel):
     bytesWritten: int | None = Field(default=None, ge=0)
     ingestResult: IngestResult | None = None
     pipelineArtifacts: list[PipelineArtifact] | None = None
+    preview: PreviewDescriptor | None = None
     segmentIds: list[str] | None = None

@@ -204,6 +204,9 @@
               "$ref": "#/components/schemas/PipelineArtifact"
             }
           },
+          "preview": {
+            "$ref": "#/components/schemas/PreviewDescriptor"
+          },
           "segmentIds": {
             "type": "array",
             "items": {
@@ -414,6 +417,9 @@
       "PipelineClaimInput": {
         "oneOf": [
           {
+            "$ref": "#/components/schemas/ExtractionPipelineInput"
+          },
+          {
             "$ref": "#/components/schemas/TranscriptionPipelineInput"
           },
           {
@@ -439,11 +445,11 @@
       "TranscriptionPipelineInput": {
         "type": "object",
         "required": [
-          "normalizedMedia",
+          "extractedAudio",
           "state"
         ],
         "properties": {
-          "normalizedMedia": {
+          "extractedAudio": {
             "$ref": "#/components/schemas/PipelineArtifact"
           },
           "state": {
@@ -568,6 +574,47 @@
           },
           "subtitles": {
             "$ref": "#/components/schemas/PipelineArtifact"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PreviewDescriptor": {
+        "type": "object",
+        "required": [
+          "expiresAtUtc",
+          "renderSha256",
+          "token"
+        ],
+        "properties": {
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "renderSha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "token": {
+            "type": "string",
+            "minLength": 32,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ExtractionPipelineInput": {
+        "type": "object",
+        "required": [
+          "normalizedMedia",
+          "state"
+        ],
+        "properties": {
+          "normalizedMedia": {
+            "$ref": "#/components/schemas/PipelineArtifact"
+          },
+          "state": {
+            "const": "EXTRACTING_AUDIO"
           }
         },
         "additionalProperties": false
