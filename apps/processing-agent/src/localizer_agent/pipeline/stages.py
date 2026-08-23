@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -16,6 +17,7 @@ from localizer_agent.pipeline.approval_gate import ApprovalSnapshot, StaleApprov
 from localizer_agent.pipeline.lineage import ArtifactRecord, StageKey
 from localizer_agent.pipeline.runner import StageResult, StageRunner
 from localizer_agent.speech.audio import TimingReviewRequired
+from localizer_agent.subtitles.writer import write_srt
 from localizer_agent.transcription.segments import TranscriptSegment
 from localizer_agent.workspace import JobWorkspace, JobWorkspaceManager
 
@@ -292,3 +294,71 @@ class VoiceHandler:
             suffix=".wav",
             tool_version=self._tool_version,
         )
+
+
+class MixingHandler:
+    def __init__(self, client: StageClient, workspace_manager: JobWorkspaceManager, *, heartbeat_interval_seconds: float) -> None:
+        self._client = client
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._workspace_manager = workspace_manager
+
+    async def handle(self, claim: ClaimJobResponse) -> None:
+        pipeline_input = claim.pipelineInput
+        if claim.state != "MIXING" or pipeline_input is None or pipeline_input.state != "MIXING":
+            raise RuntimeError("Mixing handler received an invalid state-specific claim.")
+        workspace = self._workspace_manager.open(claim.jobId)
+        script_path = _artifact_path(workspace, pipeline_input.script)
+        voice_path = _artifact_path(workspace, pipeline_input.voice)
+        audio_key = StageKey.for_input(claim.jobId, claim.jobVersion, "MIXED_AUDIO", pipeline_input.voice.sha256, "aligned-narration-v1")
+        subtitle_key = StageKey.for_input(claim.jobId, claim.jobVersion, "SUBTITLES", pipeline_input.script.sha256, "srt-v1")
+
+        async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
+            mixed, subtitles = await asyncio.gather(
+                asyncio.to_thread(self._copy_audio, workspace, audio_key, voice_path),
+                asyncio.to_thread(self._write_subtitles, workspace, subtitle_key, script_path),
+            )
+            guard.assert_active()
+            await self._client.complete(
+                claim,
+                CompleteStepRequest(
+                    expectedState="MIXING",
+                    jobVersion=claim.jobVersion,
+                    leaseToken=claim.leaseToken,
+                    pipelineArtifacts=[
+                        self._pipeline_artifact(mixed.artifact, "MIXED_AUDIO"),
+                        self._pipeline_artifact(subtitles.artifact, "SUBTITLES"),
+                    ],
+                    state="RENDERING",
+                    step="audio_and_subtitles_mixed",
+                ),
+            )
+
+    @staticmethod
+    def _copy_audio(workspace: JobWorkspace, key: StageKey, voice_path: Path) -> StageResult:
+        return StageRunner(workspace).run(
+            key,
+            execute=lambda candidate: shutil.copyfile(voice_path, candidate),
+            kind="MIXED_AUDIO",
+            suffix=".wav",
+            tool_version="aligned-narration-v1",
+        )
+
+    @staticmethod
+    def _write_subtitles(workspace: JobWorkspace, key: StageKey, script_path: Path) -> StageResult:
+        return StageRunner(workspace).run(
+            key,
+            execute=lambda candidate: write_srt(_script_segments(script_path), candidate),
+            kind="SUBTITLES",
+            suffix=".srt",
+            tool_version="srt-v1",
+        )
+
+    @staticmethod
+    def _pipeline_artifact(artifact: ArtifactRecord, kind: str) -> dict[str, int | str]:
+        return {
+            "artifactRef": artifact.path.name,
+            "byteCount": artifact.byte_count,
+            "kind": kind,
+            "sha256": artifact.sha256,
+            "toolVersion": artifact.tool_version,
+        }

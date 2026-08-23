@@ -8,7 +8,7 @@ from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
 from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
-from localizer_agent.pipeline.stages import GeminiTranslationOperations, TranslationHandler, VoiceHandler
+from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, TranslationHandler, VoiceHandler
 from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
 from localizer_agent.pipeline.transcription_stage import TranscriptionHandler
 from localizer_agent.structured_logging import create_logger
@@ -87,6 +87,12 @@ async def run() -> None:
             tool_version=voice_tool_version,
         )
         job_types_by_state["GENERATING_VOICE"] = ["IMPORT", "LOCALIZE"]
+    handlers["MIXING"] = MixingHandler(
+        client,
+        workspace_manager,
+        heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+    )
+    job_types_by_state["MIXING"] = ["IMPORT", "LOCALIZE", "RENDER"]
     supervisor = ProcessingSupervisor(
         client,
         handlers,
