@@ -78,6 +78,27 @@ def test_config_enables_gemini_only_with_complete_provider_settings(tmp_path: Pa
         AgentConfig.from_env(values)
 
 
+def test_config_enables_azure_speech_only_with_complete_provider_settings(tmp_path: Path) -> None:
+    values = {
+        "AGENT_ACCESS_TOKEN": "sensitive-token",
+        "AZURE_SPEECH_ENDPOINT": "https://eastus.tts.speech.microsoft.com/cognitiveservices/v1",
+        "AZURE_SPEECH_KEY": "azure-secret",
+        "AZURE_SPEECH_VOICE": "vi-VN-HoaiMyNeural",
+        "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "INBOX_ROOT": str(tmp_path / "inbox"),
+        "WORKSPACE_ROOT": str(tmp_path / "workspace"),
+    }
+
+    config = AgentConfig.from_env(values)
+
+    assert config.azure_speech_voice == "vi-VN-HoaiMyNeural"
+    assert "azure-secret" not in repr(config)
+
+    values.pop("AZURE_SPEECH_VOICE")
+    with pytest.raises(ConfigurationError):
+        AgentConfig.from_env(values)
+
+
 def test_structured_logs_redact_credentials_urls_and_paths() -> None:
     entries: list[str] = []
     logger = create_logger(entries.append)

@@ -65,6 +65,18 @@ def _gemini_configuration(values: Mapping[str, str]) -> tuple[str | None, str | 
     return api_key, base_url.rstrip("/"), model_id
 
 
+def _azure_speech_configuration(values: Mapping[str, str]) -> tuple[str | None, str | None, str | None]:
+    endpoint = values.get("AZURE_SPEECH_ENDPOINT", "").strip()
+    key = values.get("AZURE_SPEECH_KEY", "").strip()
+    voice = values.get("AZURE_SPEECH_VOICE", "").strip()
+    if not endpoint and not key and not voice:
+        return None, None, None
+    parsed = urlparse(endpoint)
+    if not key or not voice or parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ConfigurationError("Azure Speech requires a key, voice and credential-free HTTPS endpoint together")
+    return endpoint, key, voice
+
+
 @dataclass(frozen=True, repr=False)
 class AgentConfig:
     control_plane_url: str
@@ -76,6 +88,9 @@ class AgentConfig:
     request_timeout_seconds: int = 30
     max_source_bytes: int = 20 * 1024 * 1024 * 1024
     minimum_free_bytes: int = 5 * 1024 * 1024 * 1024
+    azure_speech_endpoint: str | None = None
+    azure_speech_key: str | None = field(default=None, repr=False)
+    azure_speech_voice: str | None = None
     gemini_api_key: str | None = field(default=None, repr=False)
     gemini_base_url: str | None = None
     gemini_model_id: str | None = None
@@ -91,8 +106,12 @@ class AgentConfig:
         inbox_root = Path(_required(env, "INBOX_ROOT")).expanduser()
         whisper_binary_path, whisper_model_path, whisper_model_sha256 = _whisper_configuration(env)
         gemini_api_key, gemini_base_url, gemini_model_id = _gemini_configuration(env)
+        azure_speech_endpoint, azure_speech_key, azure_speech_voice = _azure_speech_configuration(env)
         return cls(
             access_token=_required(env, "AGENT_ACCESS_TOKEN"),
+            azure_speech_endpoint=azure_speech_endpoint,
+            azure_speech_key=azure_speech_key,
+            azure_speech_voice=azure_speech_voice,
             control_plane_url=_control_plane_origin(_required(env, "CONTROL_PLANE_URL")),
             gemini_api_key=gemini_api_key,
             gemini_base_url=gemini_base_url,

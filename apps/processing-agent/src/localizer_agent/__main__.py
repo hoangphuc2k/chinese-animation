@@ -8,11 +8,13 @@ from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
 from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
-from localizer_agent.pipeline.stages import GeminiTranslationOperations, TranslationHandler
+from localizer_agent.pipeline.stages import GeminiTranslationOperations, TranslationHandler, VoiceHandler
 from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
 from localizer_agent.pipeline.transcription_stage import TranscriptionHandler
 from localizer_agent.structured_logging import create_logger
 from localizer_agent.supervisor import ImportSupervisor
+from localizer_agent.speech.audio import AzureVoiceOperations
+from localizer_agent.speech.azure_client import AzureSpeechClient
 from localizer_agent.transcription.whisper_cpp import WhisperCpp
 from localizer_agent.workspace import JobWorkspaceManager
 
@@ -68,6 +70,23 @@ async def run() -> None:
             tool_version=config.gemini_model_id,
         )
         job_types_by_state["TRANSLATING"] = ["IMPORT", "LOCALIZE"]
+    if config.azure_speech_endpoint is not None and config.azure_speech_key is not None and config.azure_speech_voice is not None:
+        azure_speech = AzureSpeechClient(
+            config.azure_speech_endpoint,
+            config.azure_speech_key,
+            {config.azure_speech_voice},
+            timeout_seconds=config.request_timeout_seconds,
+        )
+        voice_tool_version = f"azure:{config.azure_speech_voice}:riff-16khz-v1"
+        handlers["GENERATING_VOICE"] = VoiceHandler(
+            client,
+            workspace_manager,
+            AzureVoiceOperations(azure_speech, config.azure_speech_voice),
+            config_version=voice_tool_version,
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+            tool_version=voice_tool_version,
+        )
+        job_types_by_state["GENERATING_VOICE"] = ["IMPORT", "LOCALIZE"]
     supervisor = ProcessingSupervisor(
         client,
         handlers,

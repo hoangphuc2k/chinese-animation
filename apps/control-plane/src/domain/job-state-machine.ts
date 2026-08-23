@@ -11,7 +11,7 @@ const failureStates: readonly ProcessingState[] = ["FAILED", "CANCELLED", "EXPIR
 
 const forwardTransitions: Partial<Record<ProcessingState, readonly ProcessingState[]>> = {
   EXTRACTING_AUDIO: ["TRANSCRIBING"],
-  GENERATING_VOICE: ["MIXING"],
+  GENERATING_VOICE: ["MIXING", "TIMING_REVIEW_REQUIRED", "WAITING_SCRIPT_REVIEW"],
   INGESTING: ["PROBING"],
   MANUAL_REVIEW_REQUIRED: ["WAITING_SCRIPT_REVIEW"],
   MIXING: ["RENDERING"],

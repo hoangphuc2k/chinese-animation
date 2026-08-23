@@ -58,6 +58,11 @@ describe("job state machine", () => {
     expect(() => assertJobTransition("COMPLETED", "QUEUED")).toThrow(JobTransitionError);
     expect(() => assertJobTransition("CANCELLED", "INGESTING")).toThrow(JobTransitionError);
   });
+
+  it("routes voice approval and timing exceptions back to human review", () => {
+    expect(() => assertJobTransition("GENERATING_VOICE", "WAITING_SCRIPT_REVIEW")).not.toThrow();
+    expect(() => assertJobTransition("GENERATING_VOICE", "TIMING_REVIEW_REQUIRED")).not.toThrow();
+  });
 });
 
 describe("destination state machine", () => {
