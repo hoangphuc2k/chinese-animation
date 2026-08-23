@@ -77,6 +77,16 @@ def _azure_speech_configuration(values: Mapping[str, str]) -> tuple[str | None, 
     return endpoint, key, voice
 
 
+def _watermark_configuration(values: Mapping[str, str]) -> tuple[Path | None, str | None]:
+    path = values.get("WATERMARK_PATH", "").strip()
+    sha256 = values.get("WATERMARK_SHA256", "").strip()
+    if not path and not sha256:
+        return None, None
+    if not path or len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+        raise ConfigurationError("Rendering requires a watermark path and lowercase SHA-256 together")
+    return Path(path).expanduser(), sha256
+
+
 @dataclass(frozen=True, repr=False)
 class AgentConfig:
     control_plane_url: str
@@ -98,6 +108,8 @@ class AgentConfig:
     whisper_model_path: Path | None = None
     whisper_model_sha256: str | None = None
     whisper_binary_version: str = "whisper.cpp"
+    watermark_path: Path | None = None
+    watermark_sha256: str | None = None
 
     @classmethod
     def from_env(cls, values: Mapping[str, str] | None = None) -> "AgentConfig":
@@ -107,6 +119,7 @@ class AgentConfig:
         whisper_binary_path, whisper_model_path, whisper_model_sha256 = _whisper_configuration(env)
         gemini_api_key, gemini_base_url, gemini_model_id = _gemini_configuration(env)
         azure_speech_endpoint, azure_speech_key, azure_speech_voice = _azure_speech_configuration(env)
+        watermark_path, watermark_sha256 = _watermark_configuration(env)
         return cls(
             access_token=_required(env, "AGENT_ACCESS_TOKEN"),
             azure_speech_endpoint=azure_speech_endpoint,
@@ -126,5 +139,7 @@ class AgentConfig:
             whisper_binary_version=env.get("WHISPER_BINARY_VERSION", "whisper.cpp").strip() or "whisper.cpp",
             whisper_model_path=whisper_model_path,
             whisper_model_sha256=whisper_model_sha256,
+            watermark_path=watermark_path,
+            watermark_sha256=watermark_sha256,
             workspace_root=workspace_root,
         )

@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from pathlib import Path
 
 from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
 from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
-from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, TranslationHandler, VoiceHandler
+from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, RenderHandler, TranslationHandler, VoiceHandler
 from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
 from localizer_agent.pipeline.transcription_stage import TranscriptionHandler
 from localizer_agent.structured_logging import create_logger
 from localizer_agent.supervisor import ImportSupervisor
 from localizer_agent.speech.audio import AzureVoiceOperations
 from localizer_agent.speech.azure_client import AzureSpeechClient
+from localizer_agent.render.ffmpeg import FfmpegRenderOperations
 from localizer_agent.transcription.whisper_cpp import WhisperCpp
 from localizer_agent.workspace import JobWorkspaceManager
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 async def run() -> None:
@@ -93,6 +104,18 @@ async def run() -> None:
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
     )
     job_types_by_state["MIXING"] = ["IMPORT", "LOCALIZE", "RENDER"]
+    if config.watermark_path is not None and config.watermark_sha256 is not None:
+        if not config.watermark_path.is_file() or _sha256(config.watermark_path) != config.watermark_sha256:
+            raise RuntimeError("Configured watermark does not match its pinned SHA-256.")
+        handlers["RENDERING"] = RenderHandler(
+            client,
+            workspace_manager,
+            FfmpegRenderOperations(timeout_seconds=3600),
+            config.watermark_path,
+            heartbeat_interval_seconds=config.heartbeat_interval_seconds,
+            tool_version="ffmpeg-h264-aac-v1",
+        )
+        job_types_by_state["RENDERING"] = ["IMPORT", "LOCALIZE", "RENDER"]
     supervisor = ProcessingSupervisor(
         client,
         handlers,

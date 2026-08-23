@@ -16,6 +16,7 @@ from localizer_agent.localization.validator import ScriptSegment, validate_scrip
 from localizer_agent.pipeline.approval_gate import ApprovalSnapshot, StaleApprovalError, require_exact_approval
 from localizer_agent.pipeline.lineage import ArtifactRecord, StageKey
 from localizer_agent.pipeline.runner import StageResult, StageRunner
+from localizer_agent.render.ffmpeg import RenderInputs
 from localizer_agent.speech.audio import TimingReviewRequired
 from localizer_agent.subtitles.writer import write_srt
 from localizer_agent.transcription.segments import TranscriptSegment
@@ -42,6 +43,10 @@ class TranslationOperations(Protocol):
 
 class VoiceOperations(Protocol):
     def synthesize(self, job_id: str, segments: Sequence[ScriptSegment]) -> bytes: ...
+
+
+class RenderOperations(Protocol):
+    def render(self, inputs: RenderInputs) -> None: ...
 
 
 class GeminiTranslationOperations:
@@ -362,3 +367,84 @@ class MixingHandler:
             "sha256": artifact.sha256,
             "toolVersion": artifact.tool_version,
         }
+
+
+class RenderHandler:
+    def __init__(
+        self,
+        client: StageClient,
+        workspace_manager: JobWorkspaceManager,
+        operations: RenderOperations,
+        watermark_path: Path,
+        *,
+        heartbeat_interval_seconds: float,
+        tool_version: str,
+    ) -> None:
+        if not watermark_path.is_file() or not tool_version:
+            raise ValueError("Rendering requires a watermark file and tool version.")
+        self._client = client
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._operations = operations
+        self._tool_version = tool_version
+        self._watermark_path = watermark_path
+        self._workspace_manager = workspace_manager
+
+    async def handle(self, claim: ClaimJobResponse) -> None:
+        pipeline_input = claim.pipelineInput
+        if claim.state != "RENDERING" or pipeline_input is None or pipeline_input.state != "RENDERING":
+            raise RuntimeError("Render handler received an invalid state-specific claim.")
+        workspace = self._workspace_manager.open(claim.jobId)
+        normalized = ArtifactRecord.from_path(workspace.normalized_path, kind="NORMALIZED_MEDIA", tool_version=pipeline_input.normalizedMedia.toolVersion)
+        if normalized.sha256 != pipeline_input.normalizedMedia.sha256 or normalized.byte_count != pipeline_input.normalizedMedia.byteCount:
+            raise RuntimeError("Normalized media does not match render claim lineage.")
+        narration = _artifact_path(workspace, pipeline_input.mixedAudio)
+        subtitles = _artifact_path(workspace, pipeline_input.subtitles)
+        key = StageKey.for_input(claim.jobId, claim.jobVersion, claim.state, pipeline_input.mixedAudio.sha256, self._tool_version)
+
+        async with LeaseGuard(self._client, claim, self._heartbeat_interval_seconds) as guard:
+            approval = await self._client.get_script_approval(
+                claim.jobId,
+                script_version=pipeline_input.scriptVersion,
+                content_sha256=pipeline_input.scriptSha256,
+            )
+            try:
+                require_exact_approval(claim.jobId, pipeline_input.scriptVersion, pipeline_input.scriptSha256, approval)
+            except StaleApprovalError:
+                guard.assert_active()
+                await self._client.complete(
+                    claim,
+                    CompleteStepRequest(
+                        expectedState="RENDERING",
+                        jobVersion=claim.jobVersion,
+                        leaseToken=claim.leaseToken,
+                        state="WAITING_SCRIPT_REVIEW",
+                        step="render_approval_stale",
+                    ),
+                )
+                return
+            result = await asyncio.to_thread(self._run_stage, workspace, key, narration, subtitles)
+            guard.assert_active()
+            artifact = result.artifact
+            await self._client.complete(
+                claim,
+                CompleteStepRequest(
+                    expectedState="RENDERING",
+                    jobVersion=claim.jobVersion,
+                    leaseToken=claim.leaseToken,
+                    pipelineArtifacts=[MixingHandler._pipeline_artifact(artifact, "RENDER")],
+                    state="READY_FOR_PREVIEW",
+                    step="render_validated",
+                ),
+            )
+
+    def _run_stage(self, workspace: JobWorkspace, key: StageKey, narration: Path, subtitles: Path) -> StageResult:
+        def execute(candidate: Path) -> None:
+            self._operations.render(RenderInputs(candidate, narration, workspace.normalized_path, subtitles, self._watermark_path))
+
+        return StageRunner(workspace).run(
+            key,
+            execute=execute,
+            kind="RENDER",
+            suffix=".mp4",
+            tool_version=self._tool_version,
+        )

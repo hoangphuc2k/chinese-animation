@@ -99,6 +99,19 @@ def test_config_enables_azure_speech_only_with_complete_provider_settings(tmp_pa
         AgentConfig.from_env(values)
 
 
+def test_config_enables_rendering_only_with_a_pinned_watermark(tmp_path: Path) -> None:
+    values = {
+        "AGENT_ACCESS_TOKEN": "sensitive-token", "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "INBOX_ROOT": str(tmp_path / "inbox"), "WATERMARK_PATH": str(tmp_path / "watermark.png"),
+        "WATERMARK_SHA256": "a" * 64, "WORKSPACE_ROOT": str(tmp_path / "workspace"),
+    }
+    config = AgentConfig.from_env(values)
+    assert config.watermark_path == tmp_path / "watermark.png"
+    values.pop("WATERMARK_SHA256")
+    with pytest.raises(ConfigurationError):
+        AgentConfig.from_env(values)
+
+
 def test_structured_logs_redact_credentials_urls_and_paths() -> None:
     entries: list[str] = []
     logger = create_logger(entries.append)
