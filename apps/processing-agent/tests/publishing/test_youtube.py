@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -12,7 +13,10 @@ import pytest
 
 from localizer_agent.publishing.models import Destination, PublicationApprovalSnapshot, PublicationCommand
 from localizer_agent.publishing.youtube import (
+    AmbiguousYouTubeCreationError,
+    CheckpointStore,
     ChunkResult,
+    FileCheckpointStore,
     MemoryCheckpointStore,
     RetryableYouTubeError,
     SessionExpiredError,
@@ -32,6 +36,8 @@ from tests.publishing.test_metadata import valid_command
 
 CHUNK_SIZE = 256 * 1024
 MEDIA_BYTES = b"a" * CHUNK_SIZE + b"tail"
+SESSION_1 = "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=session-1"
+EXISTING_SESSION = "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=existing"
 
 
 class Vault:
@@ -53,9 +59,11 @@ class Approvals:
 class Gateway:
     def __init__(self) -> None:
         self.events: list[object] = []
+        self.create_results: list[object] = []
         self.upload_results: list[object] = []
         self.query_results: list[object] = []
-        self.processing: list[str] = ["succeeded"]
+        self.processing: list[object] = ["succeeded"]
+        self.on_create: Callable[[], None] | None = None
         self.on_exchange: Callable[[], None] | None = None
 
     async def exchange_refresh_token(self, credentials: YouTubeCredentials) -> str:
@@ -66,8 +74,15 @@ class Gateway:
 
     async def create_session(self, *, access_token: str, byte_count: int, correlation: str, metadata: dict[str, object]) -> str:
         self.events.append(("create", metadata, byte_count, correlation))
+        if self.on_create is not None:
+            self.on_create()
+        if self.create_results:
+            result = self.create_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return str(result)
         count = len([event for event in self.events if isinstance(event, tuple) and event[0] == "create"])
-        return f"session-{count}"
+        return f"https://www.googleapis.com/upload/youtube/v3/videos?upload_id=session-{count}"
 
     async def upload_chunk(
         self,
@@ -100,7 +115,10 @@ class Gateway:
 
     async def processing_status(self, *, access_token: str, video_id: str) -> str:
         self.events.append(("processing", video_id))
-        return self.processing.pop(0)
+        result = self.processing.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return str(result)
 
 
 class Delays:
@@ -156,6 +174,7 @@ def checkpoint_for(
 ) -> YouTubeCheckpoint:
     values: dict[str, object] = {
         "byte_count": expected_byte_count,
+        "creation_pending": False,
         "metadata_sha256": command.metadata_sha256,
         "next_offset": next_offset,
         "provider_correlation": command.provider_correlation,
@@ -170,11 +189,12 @@ def checkpoint_for(
 def run_upload(
     tmp_path: Path,
     gateway: Gateway,
-    store: MemoryCheckpointStore | None = None,
+    store: CheckpointStore | None = None,
     *,
     payload: bytes = MEDIA_BYTES,
     delays: Delays | None = None,
     max_retries: int = 2,
+    max_processing_retries: int = 2,
     max_session_recreations: int = 2,
     max_processing_polls: int = 3,
 ):
@@ -187,6 +207,7 @@ def run_upload(
         credentials_loader(),
         chunk_size=CHUNK_SIZE,
         max_retries=max_retries,
+        max_processing_retries=max_processing_retries,
         max_session_recreations=max_session_recreations,
         max_processing_polls=max_processing_polls,
         retry_delay=delay,
@@ -261,13 +282,14 @@ def test_upload_is_chunked_checkpointed_private_and_returns_studio_link(tmp_path
     assert checkpoint == checkpoint_for(
         command,
         len(MEDIA_BYTES),
-        session_reference="session-1",
+        session_reference=SESSION_1,
         next_offset=len(MEDIA_BYTES),
         video_id="Video_Id-1",
     )
     assert checkpoint is not None
     assert set(vars(checkpoint)) == {
         "byte_count",
+        "creation_pending",
         "metadata_sha256",
         "next_offset",
         "provider_correlation",
@@ -301,7 +323,7 @@ def test_restart_reconciles_provider_offset_before_sending_a_chunk(tmp_path: Pat
         checkpoint_for(
             command,
             len(MEDIA_BYTES),
-            session_reference="existing",
+            session_reference=EXISTING_SESSION,
             next_offset=CHUNK_SIZE,
             video_id=None,
         ),
@@ -310,8 +332,8 @@ def test_restart_reconciles_provider_offset_before_sending_a_chunk(tmp_path: Pat
     run_upload(tmp_path, gateway, store)
 
     assert not any(isinstance(event, tuple) and event[0] == "create" for event in gateway.events)
-    query_index = gateway.events.index(("query", "existing"))
-    chunk_index = gateway.events.index(("chunk", 0, MEDIA_BYTES[:CHUNK_SIZE], "existing"))
+    query_index = gateway.events.index(("query", EXISTING_SESSION))
+    chunk_index = gateway.events.index(("chunk", 0, MEDIA_BYTES[:CHUNK_SIZE], EXISTING_SESSION))
     assert query_index < chunk_index
 
 
@@ -323,7 +345,7 @@ def test_retry_queries_provider_offset_and_honors_exponential_delay(tmp_path: Pa
 
     run_upload(tmp_path, gateway, delays=delays)
 
-    assert ("query", "session-1") in gateway.events
+    assert ("query", SESSION_1) in gateway.events
     assert delays.values == [1.0]
     assert len([event for event in gateway.events if isinstance(event, tuple) and event[0] == "chunk" and event[1] == 0]) == 2
 
@@ -339,6 +361,40 @@ def test_chunk_retry_is_bounded(tmp_path: Path) -> None:
 
     assert delays.values == [1.0, 2.0]
     assert len([event for event in gateway.events if isinstance(event, tuple) and event[0] == "chunk"]) == 3
+
+
+def test_processing_status_retry_recovers_with_its_own_exponential_budget(tmp_path: Path) -> None:
+    gateway = Gateway()
+    gateway.processing = [RetryableYouTubeError(), RetryableYouTubeError(), "succeeded"]
+    delays = Delays()
+
+    result, _ = run_upload(
+        tmp_path,
+        gateway,
+        delays=delays,
+        max_retries=0,
+        max_processing_retries=2,
+    )
+
+    assert result.video_id == "Video_Id-1"
+    assert delays.values == [1.0, 2.0]
+
+
+def test_processing_status_retry_exhaustion_is_bounded_and_sanitized(tmp_path: Path) -> None:
+    gateway = Gateway()
+    gateway.processing = [
+        RetryableYouTubeError("provider secret-value"),
+        RetryableYouTubeError("provider secret-value"),
+        RetryableYouTubeError("provider secret-value"),
+    ]
+    delays = Delays()
+
+    with pytest.raises(RetryableYouTubeError, match="processing status retry bound") as raised:
+        run_upload(tmp_path, gateway, delays=delays, max_processing_retries=2)
+
+    assert "secret-value" not in str(raised.value)
+    assert delays.values == [1.0, 2.0]
+    assert len([event for event in gateway.events if isinstance(event, tuple) and event[0] == "processing"]) == 3
 
 
 def test_expired_session_starts_a_new_private_session(tmp_path: Path) -> None:
@@ -364,7 +420,7 @@ def test_expired_reconciled_session_is_recreated_before_upload(tmp_path: Path) -
         checkpoint_for(
             command,
             len(MEDIA_BYTES),
-            session_reference="existing",
+            session_reference=EXISTING_SESSION,
             next_offset=CHUNK_SIZE,
             video_id=None,
         ),
@@ -372,8 +428,8 @@ def test_expired_reconciled_session_is_recreated_before_upload(tmp_path: Path) -
 
     run_upload(tmp_path, gateway, store)
 
-    assert gateway.events.index(("query", "existing")) < gateway.events.index(
-        ("chunk", 0, MEDIA_BYTES[:CHUNK_SIZE], "session-1")
+    assert gateway.events.index(("query", EXISTING_SESSION)) < gateway.events.index(
+        ("chunk", 0, MEDIA_BYTES[:CHUNK_SIZE], SESSION_1)
     )
 
 
@@ -385,6 +441,193 @@ def test_successful_chunk_response_must_advance_or_complete(tmp_path: Path) -> N
         run_upload(tmp_path, gateway)
 
     assert len([event for event in gateway.events if isinstance(event, tuple) and event[0] == "chunk"]) == 1
+
+
+def test_file_checkpoint_store_survives_a_genuine_new_instance_restart(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    first_store = FileCheckpointStore(checkpoint_root)
+    first_gateway = Gateway()
+    first_gateway.upload_results = [ChunkResult(CHUNK_SIZE, None), YouTubeQuotaError()]
+
+    with pytest.raises(YouTubeQuotaError):
+        run_upload(tmp_path, first_gateway, first_store)
+
+    _, command = write_media(tmp_path)
+    checkpoint_path = checkpoint_root / f"{command.publication_id}.json"
+    persisted = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    assert persisted == {
+        "byte_count": len(MEDIA_BYTES),
+        "creation_pending": False,
+        "metadata_sha256": command.metadata_sha256,
+        "next_offset": CHUNK_SIZE,
+        "provider_correlation": command.provider_correlation,
+        "render_sha256": command.render_sha256,
+        "session_reference": SESSION_1,
+        "video_id": None,
+    }
+    assert not list(checkpoint_root.glob("*.tmp"))
+    assert "access-token" not in checkpoint_path.read_text(encoding="utf-8")
+
+    second_store = FileCheckpointStore(checkpoint_root)
+    second_gateway = Gateway()
+    second_gateway.query_results = [ChunkResult(CHUNK_SIZE, None)]
+
+    result, _ = run_upload(tmp_path, second_gateway, second_store)
+
+    assert second_gateway.events.index(("query", SESSION_1)) < second_gateway.events.index(
+        ("chunk", CHUNK_SIZE, b"tail", SESSION_1)
+    )
+    assert result.video_id == "Video_Id-1"
+    assert FileCheckpointStore(checkpoint_root).load(command.publication_id).video_id == "Video_Id-1"
+
+
+def test_malformed_durable_checkpoint_fails_closed_before_provider_calls(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    media, command = write_media(tmp_path)
+    (checkpoint_root / f"{command.publication_id}.json").write_text("{not-json", encoding="utf-8")
+    gateway = Gateway()
+    adapter = YouTubeAdapter(Approvals(), gateway, store, credentials_loader())
+
+    with pytest.raises(YouTubeCheckpointError, match="malformed"):
+        asyncio.run(adapter.publish(command, media))
+
+    assert gateway.events == []
+
+
+def test_broken_symlink_checkpoint_fails_closed(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    _, command = write_media(tmp_path)
+    (checkpoint_root / f"{command.publication_id}.json").symlink_to(tmp_path / "missing-checkpoint")
+
+    with pytest.raises(YouTubeCheckpointError, match="malformed"):
+        store.load(command.publication_id)
+
+
+def test_durable_checkpoint_deserialization_requires_exact_typed_fields(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    _, command = write_media(tmp_path)
+    checkpoint = checkpoint_for(
+        command,
+        len(MEDIA_BYTES),
+        session_reference=SESSION_1,
+        next_offset=CHUNK_SIZE,
+        video_id=None,
+    )
+    store.save(command.publication_id, checkpoint)
+    checkpoint_path = checkpoint_root / f"{command.publication_id}.json"
+    valid = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    malformed_values = [
+        valid | {"next_offset": True},
+        valid | {"byte_count": "262148"},
+        valid | {"creation_pending": 0},
+        valid | {"session_reference": "https://attacker.invalid/upload"},
+        valid | {"video_id": "bad id", "next_offset": len(MEDIA_BYTES)},
+        valid | {"unexpected": "field"},
+        {key: value for key, value in valid.items() if key != "render_sha256"},
+    ]
+
+    for malformed in malformed_values:
+        checkpoint_path.write_text(json.dumps(malformed), encoding="utf-8")
+        with pytest.raises(YouTubeCheckpointError, match="malformed"):
+            FileCheckpointStore(checkpoint_root).load(command.publication_id)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"next_offset": True},
+        {"creation_pending": "false"},
+        {"session_reference": "opaque-session"},
+        {"session_reference": "https://attacker.invalid/upload"},
+        {"session_reference": "https://www.googleapis.com/oauth2/token"},
+        {"next_offset": len(MEDIA_BYTES), "video_id": "bad id"},
+    ],
+)
+def test_checkpoint_values_from_any_store_are_validated_before_provider_calls(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    store = MemoryCheckpointStore()
+    media, command = write_media(tmp_path)
+    store.save(
+        command.publication_id,
+        replace(
+            checkpoint_for(
+                command,
+                len(MEDIA_BYTES),
+                session_reference=SESSION_1,
+                next_offset=0,
+                video_id=None,
+            ),
+            **changes,
+        ),
+    )
+    gateway = Gateway()
+    adapter = YouTubeAdapter(Approvals(), gateway, store, credentials_loader())
+
+    with pytest.raises(YouTubeCheckpointError):
+        asyncio.run(adapter.publish(command, media))
+
+    assert gateway.events == []
+
+
+def test_creation_intent_is_durable_before_request_and_blocks_ambiguous_retry(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    _, command = write_media(tmp_path)
+    observed: list[YouTubeCheckpoint | None] = []
+    gateway = Gateway()
+    gateway.create_results = [RetryableYouTubeError("provider secret-value")]
+    gateway.on_create = lambda: observed.append(FileCheckpointStore(checkpoint_root).load(command.publication_id))
+
+    with pytest.raises(AmbiguousYouTubeCreationError, match="manual recovery") as raised:
+        run_upload(tmp_path, gateway, store)
+
+    assert "secret-value" not in str(raised.value)
+    assert observed and observed[0] is not None and observed[0].creation_pending is True
+    persisted = FileCheckpointStore(checkpoint_root).load(command.publication_id)
+    assert persisted is not None and persisted.creation_pending is True
+    assert persisted.session_reference is None
+
+    restarted_gateway = Gateway()
+    with pytest.raises(AmbiguousYouTubeCreationError, match="manual recovery"):
+        run_upload(tmp_path, restarted_gateway, FileCheckpointStore(checkpoint_root))
+    assert restarted_gateway.events == []
+
+
+def test_invalid_session_creation_response_remains_ambiguous(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    gateway = Gateway()
+    gateway.create_results = [YouTubeProcessingError("missing session reference")]
+
+    with pytest.raises(AmbiguousYouTubeCreationError, match="manual recovery"):
+        run_upload(tmp_path, gateway, store)
+
+    _, command = write_media(tmp_path)
+    checkpoint = FileCheckpointStore(checkpoint_root).load(command.publication_id)
+    assert checkpoint is not None and checkpoint.creation_pending is True
+
+
+def test_explicit_session_creation_rejection_allows_a_later_safe_attempt(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    store = FileCheckpointStore(checkpoint_root)
+    gateway = Gateway()
+    gateway.create_results = [YouTubeAuthError("rejected")]
+
+    with pytest.raises(YouTubeAuthError):
+        run_upload(tmp_path, gateway, store)
+
+    _, command = write_media(tmp_path)
+    rejected = FileCheckpointStore(checkpoint_root).load(command.publication_id)
+    assert rejected is not None and rejected.creation_pending is False
+    assert rejected.session_reference is None
+
+    result, _ = run_upload(tmp_path, Gateway(), FileCheckpointStore(checkpoint_root))
+    assert result.video_id == "Video_Id-1"
 
 
 def test_expired_session_recreation_is_bounded(tmp_path: Path) -> None:
@@ -435,7 +678,7 @@ def test_stale_checkpoint_bindings_are_rejected_before_provider_calls(tmp_path: 
         checkpoint_for(
             command,
             len(MEDIA_BYTES),
-            session_reference="existing",
+            session_reference=EXISTING_SESSION,
             next_offset=0,
             video_id=None,
             **{field: value},
@@ -486,7 +729,7 @@ def test_processing_poll_count_and_delays_are_bounded(tmp_path: Path) -> None:
 
 
 def test_http_gateway_exchanges_oauth_and_parses_resumable_protocol() -> None:
-    session_url = "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=opaque"
+    session_url = SESSION_1
     transport = Transport(
         YouTubeHttpResponse(200, {}, b'{"access_token":"fresh-token"}'),
         YouTubeHttpResponse(200, {"Location": session_url}, b""),
