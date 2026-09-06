@@ -16,6 +16,7 @@ from localizer_agent.publishing.youtube import (
     AmbiguousYouTubeCreationError,
     CheckpointStore,
     ChunkResult,
+    ConcurrentYouTubePublishError,
     FileCheckpointStore,
     MemoryCheckpointStore,
     RetryableYouTubeError,
@@ -543,6 +544,9 @@ def test_durable_checkpoint_deserialization_requires_exact_typed_fields(tmp_path
         {"session_reference": "opaque-session"},
         {"session_reference": "https://attacker.invalid/upload"},
         {"session_reference": "https://www.googleapis.com/oauth2/token"},
+        {"session_reference": f"{SESSION_1}&access_token=secret-value"},
+        {"session_reference": f"{SESSION_1}&upload_id="},
+        {"session_reference": f"{SESSION_1}&unexpected=value"},
         {"next_offset": len(MEDIA_BYTES), "video_id": "bad id"},
     ],
 )
@@ -628,6 +632,66 @@ def test_explicit_session_creation_rejection_allows_a_later_safe_attempt(tmp_pat
 
     result, _ = run_upload(tmp_path, Gateway(), FileCheckpointStore(checkpoint_root))
     assert result.video_id == "Video_Id-1"
+
+
+def test_concurrent_adapters_cannot_both_create_a_session(tmp_path: Path) -> None:
+    media, command = write_media(tmp_path, b"approved")
+    store = MemoryCheckpointStore()
+
+    class BlockingGateway(Gateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.creation_started = asyncio.Event()
+            self.release_creation = asyncio.Event()
+
+        async def create_session(
+            self,
+            *,
+            access_token: str,
+            byte_count: int,
+            correlation: str,
+            metadata: dict[str, object],
+        ) -> str:
+            self.events.append(("create", metadata, byte_count, correlation))
+            self.creation_started.set()
+            await self.release_creation.wait()
+            return SESSION_1
+
+    first_gateway = BlockingGateway()
+    second_gateway = Gateway()
+    first_adapter = YouTubeAdapter(
+        Approvals(), first_gateway, store, credentials_loader(), retry_delay=Delays()
+    )
+    second_adapter = YouTubeAdapter(
+        Approvals(), second_gateway, store, credentials_loader(), retry_delay=Delays()
+    )
+
+    async def exercise() -> None:
+        first = asyncio.create_task(first_adapter.publish(command, media))
+        await first_gateway.creation_started.wait()
+        with pytest.raises(ConcurrentYouTubePublishError, match="already in progress"):
+            await second_adapter.publish(command, media)
+        assert second_gateway.events == []
+        first_gateway.release_creation.set()
+        await first
+
+    asyncio.run(exercise())
+    assert len([event for event in first_gateway.events if isinstance(event, tuple) and event[0] == "create"]) == 1
+
+
+def test_durable_store_reservation_is_exclusive_across_instances_and_releases(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "youtube-checkpoints"
+    _, command = write_media(tmp_path)
+    first_store = FileCheckpointStore(checkpoint_root)
+    second_store = FileCheckpointStore(checkpoint_root)
+
+    with first_store.reserve(command.publication_id):
+        with pytest.raises(ConcurrentYouTubePublishError, match="already in progress"):
+            with second_store.reserve(command.publication_id):
+                pytest.fail("concurrent durable reservation was admitted")
+
+    with second_store.reserve(command.publication_id):
+        pass
 
 
 def test_expired_session_recreation_is_bounded(tmp_path: Path) -> None:

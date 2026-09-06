@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
-from collections.abc import Awaitable, Callable, Mapping
+import threading
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol
@@ -27,6 +30,8 @@ _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{6,64}")
 _RANGE = re.compile(r"bytes=0-(\d+)")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PROVIDER_CORRELATION = re.compile(r"localizer-[0-9a-f]{64}")
+_UPLOAD_ID = re.compile(r"[A-Za-z0-9._~-]{1,2048}")
+_SESSION_HOSTS = {"www.googleapis.com", "youtube.googleapis.com"}
 
 
 class RetryableYouTubeError(RuntimeError):
@@ -57,6 +62,10 @@ class AmbiguousYouTubeCreationError(RuntimeError):
     """A session-creation request may have been accepted without returning its reference."""
 
 
+class ConcurrentYouTubePublishError(RuntimeError):
+    """Another process or task owns this publication's upload state machine."""
+
+
 @dataclass(frozen=True)
 class ChunkResult:
     next_offset: int
@@ -82,6 +91,8 @@ class YouTubePublishResult:
 
 
 class CheckpointStore(Protocol):
+    def reserve(self, publication_id: str) -> AbstractContextManager[None]: ...
+
     def load(self, publication_id: str) -> YouTubeCheckpoint | None: ...
 
     def save(self, publication_id: str, checkpoint: YouTubeCheckpoint) -> None: ...
@@ -90,6 +101,20 @@ class CheckpointStore(Protocol):
 class MemoryCheckpointStore:
     def __init__(self) -> None:
         self._values: dict[str, YouTubeCheckpoint] = {}
+        self._reservation_guard = threading.Lock()
+        self._reservations: set[str] = set()
+
+    @contextmanager
+    def reserve(self, publication_id: str) -> Iterator[None]:
+        with self._reservation_guard:
+            if publication_id in self._reservations:
+                raise ConcurrentYouTubePublishError("A YouTube publish for this publication is already in progress.")
+            self._reservations.add(publication_id)
+        try:
+            yield
+        finally:
+            with self._reservation_guard:
+                self._reservations.remove(publication_id)
 
     def load(self, publication_id: str) -> YouTubeCheckpoint | None:
         return self._values.get(publication_id)
@@ -113,16 +138,26 @@ def _safe_session_reference(value: str) -> bool:
         return False
     parsed = urlparse(value)
     hostname = parsed.hostname or ""
-    upload_ids = parse_qs(parsed.query).get("upload_id", [])
+    try:
+        port = parsed.port
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    if set(query) - {"upload_id", "upload_protocol"}:
+        return False
+    upload_ids = query.get("upload_id", [])
+    upload_protocols = query.get("upload_protocol", [])
     return (
         parsed.scheme == "https"
         and parsed.username is None
         and parsed.password is None
+        and port in {None, 443}
         and not parsed.fragment
-        and (hostname == "googleapis.com" or hostname.endswith(".googleapis.com"))
+        and hostname in _SESSION_HOSTS
         and parsed.path == "/upload/youtube/v3/videos"
         and len(upload_ids) == 1
-        and bool(upload_ids[0])
+        and _UPLOAD_ID.fullmatch(upload_ids[0]) is not None
+        and (not upload_protocols or upload_protocols == ["resumable"])
     )
 
 
@@ -187,6 +222,33 @@ class FileCheckpointStore:
             raise YouTubeCheckpointError("YouTube checkpoint directory is unavailable.") from None
         if not self._root.is_dir() or self._root.is_symlink():
             raise YouTubeCheckpointError("YouTube checkpoint directory is unavailable.")
+
+    @contextmanager
+    def reserve(self, publication_id: str) -> Iterator[None]:
+        _checkpoint_path(self._root, publication_id)
+        lock_path = self._root / f".{publication_id}.lock"
+        descriptor: int | None = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lock_path, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConcurrentYouTubePublishError(
+                    "A YouTube publish for this publication is already in progress."
+                ) from None
+            yield
+        except ConcurrentYouTubePublishError:
+            raise
+        except OSError:
+            raise YouTubeCheckpointError("YouTube checkpoint reservation is unavailable.") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
 
     def load(self, publication_id: str) -> YouTubeCheckpoint | None:
         path = _checkpoint_path(self._root, publication_id)
@@ -616,6 +678,10 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
         self._max_backoff_seconds = max_backoff_seconds
 
     async def publish_approved(self, command: PublicationCommand, media_path: Path) -> YouTubePublishResult:
+        with self._checkpoints.reserve(command.publication_id):
+            return await self._publish_exclusive(command, media_path)
+
+    async def _publish_exclusive(self, command: PublicationCommand, media_path: Path) -> YouTubePublishResult:
         metadata = command.metadata.for_destination(self.destination)
         if not isinstance(metadata, YouTubeMetadata):
             raise ValueError("YouTube command requires YouTube metadata.")
@@ -899,6 +965,7 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
 __all__ = [
     "AmbiguousYouTubeCreationError",
     "CheckpointStore",
+    "ConcurrentYouTubePublishError",
     "FileCheckpointStore",
     "YouTubeAdapter",
     "YouTubeAuthError",
