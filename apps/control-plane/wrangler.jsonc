@@ -22,8 +22,9 @@
     "ACCESS_AUDIENCE": "local-access-audience",
     "ACCESS_ISSUER": "https://access.example.invalid",
     "ADMIN_EMAIL": "admin@example.invalid",
+    "ADMIN_ORIGIN": "https://control-plane.example.invalid",
     "AGENT_ACCESS_AUDIENCE": "local-agent-audience",
-    "AGENT_SERVICE_SUBJECT": "local-agent-subject",
+    "AGENT_SERVICE_CLIENT_ID": "local-agent-client.access",
     "DEPLOYMENT_VERSION": "development",
     "ENVIRONMENT": "development",
     "PREVIEW_ORIGIN": "https://preview.example.invalid"

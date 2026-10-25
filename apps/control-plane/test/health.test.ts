@@ -40,3 +40,11 @@ describe("unknown API routes", () => {
     });
   });
 });
+
+describe("GET /api/v1/session/csrf-token", () => {
+  it("is routed and requires an Access identity", async () => {
+    const response = await app.request("https://control-plane.test/api/v1/session/csrf-token", undefined, createTestEnv());
+
+    expect(response.status).toBe(401);
+  });
+});
