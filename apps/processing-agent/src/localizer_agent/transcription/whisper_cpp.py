@@ -31,6 +31,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def json_output_path(output_prefix: Path) -> Path:
+    """whisper.cpp appends `.json` to the `-of` prefix; it does not replace an existing suffix."""
+    return output_prefix.with_name(f"{output_prefix.name}.json")
+
+
 class WhisperCpp:
     def __init__(
         self,
@@ -71,7 +76,7 @@ class WhisperCpp:
     def extract_pcm(self, source: Path, destination: Path) -> None:
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         result = self._runner.run(
-            ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(destination)],
+            ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", str(source), "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-f", "wav", str(destination)],
             self._timeout_seconds,
         )
         if result.return_code != 0:
@@ -82,7 +87,7 @@ class WhisperCpp:
         result = self._runner.run(self.command(audio_path, output_prefix), self._timeout_seconds)
         if result.return_code != 0:
             raise WhisperError("whisper.cpp transcription failed.")
-        output_path = output_prefix.with_suffix(".json")
+        output_path = json_output_path(output_prefix)
         try:
             payload: Any = json.loads(output_path.read_bytes())
             raw_segments = payload["transcription"]

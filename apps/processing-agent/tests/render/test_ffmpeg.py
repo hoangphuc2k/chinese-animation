@@ -47,3 +47,16 @@ def test_render_operations_probe_and_validate_the_produced_streams(tmp_path: Pat
     FfmpegRenderOperations(runner=runner).render(inputs)
 
     assert [call[0] for call in runner.calls] == ["ffmpeg", "ffprobe"]
+
+
+def test_render_command_names_the_mp4_muxer_because_stage_outputs_end_in_tmp(tmp_path: Path) -> None:
+    destination = tmp_path / ".render-x.mp4.tmp"
+    inputs = RenderInputs(
+        destination=destination,
+        narration=tmp_path / "voice.wav",
+        normalized_media=tmp_path / "normalized.mp4",
+        subtitles=tmp_path / "captions.srt",
+        watermark=tmp_path / "watermark.png",
+    )
+
+    assert build_render_command(inputs)[-3:] == ["-f", "mp4", str(destination)]

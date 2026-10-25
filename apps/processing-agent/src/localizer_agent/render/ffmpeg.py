@@ -61,6 +61,9 @@ def build_render_command(inputs: RenderInputs) -> list[str]:
         "-movflags",
         "+faststart",
         "-shortest",
+        # Stage outputs are written to `*.tmp` candidates, so the muxer cannot be inferred from the name.
+        "-f",
+        "mp4",
         str(inputs.destination),
     ]
 
