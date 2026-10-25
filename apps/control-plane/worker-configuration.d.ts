@@ -5,8 +5,9 @@ interface __BaseEnv_Env {
 	ACCESS_AUDIENCE: string;
 	ACCESS_ISSUER: string;
 	ADMIN_EMAIL: string;
+	ADMIN_ORIGIN: string;
 	AGENT_ACCESS_AUDIENCE: string;
-	AGENT_SERVICE_SUBJECT: string;
+	AGENT_SERVICE_CLIENT_ID: string;
 	DEPLOYMENT_VERSION: string;
 	ENVIRONMENT: string;
 	PREVIEW_ORIGIN: string;
@@ -22,5 +23,5 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "ACCESS_AUDIENCE" | "ACCESS_ISSUER" | "ADMIN_EMAIL" | "AGENT_ACCESS_AUDIENCE" | "AGENT_SERVICE_SUBJECT" | "DEPLOYMENT_VERSION" | "ENVIRONMENT" | "PREVIEW_ORIGIN">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "ACCESS_AUDIENCE" | "ACCESS_ISSUER" | "ADMIN_EMAIL" | "ADMIN_ORIGIN" | "AGENT_ACCESS_AUDIENCE" | "AGENT_SERVICE_CLIENT_ID" | "DEPLOYMENT_VERSION" | "ENVIRONMENT" | "PREVIEW_ORIGIN">> {}
 }

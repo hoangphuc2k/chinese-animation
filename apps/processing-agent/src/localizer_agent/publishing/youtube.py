@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
+import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
+import tempfile
+import threading
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+from uuid import UUID
 
 from localizer_agent.publishing.base import ApprovalBoundPublicationAdapter, PublicationApprovalClient
 from localizer_agent.publishing.models import Destination, PublicationCommand, YouTubeMetadata
@@ -22,6 +28,10 @@ from localizer_agent.publishing.youtube_auth import YouTubeAuthError, YouTubeCre
 _CHUNK_GRANULARITY = 256 * 1024
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{6,64}")
 _RANGE = re.compile(r"bytes=0-(\d+)")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_PROVIDER_CORRELATION = re.compile(r"localizer-[0-9a-f]{64}")
+_UPLOAD_ID = re.compile(r"[A-Za-z0-9._~-]{1,2048}")
+_SESSION_HOSTS = {"www.googleapis.com", "youtube.googleapis.com"}
 
 
 class RetryableYouTubeError(RuntimeError):
@@ -48,6 +58,14 @@ class YouTubeCheckpointError(RuntimeError):
     """A durable checkpoint is malformed or bound to different inputs."""
 
 
+class AmbiguousYouTubeCreationError(RuntimeError):
+    """A session-creation request may have been accepted without returning its reference."""
+
+
+class ConcurrentYouTubePublishError(RuntimeError):
+    """Another process or task owns this publication's upload state machine."""
+
+
 @dataclass(frozen=True)
 class ChunkResult:
     next_offset: int
@@ -60,6 +78,7 @@ class YouTubeCheckpoint:
     render_sha256: str
     metadata_sha256: str
     byte_count: int
+    creation_pending: bool
     session_reference: str | None
     next_offset: int
     video_id: str | None
@@ -72,6 +91,8 @@ class YouTubePublishResult:
 
 
 class CheckpointStore(Protocol):
+    def reserve(self, publication_id: str) -> AbstractContextManager[None]: ...
+
     def load(self, publication_id: str) -> YouTubeCheckpoint | None: ...
 
     def save(self, publication_id: str, checkpoint: YouTubeCheckpoint) -> None: ...
@@ -80,12 +101,223 @@ class CheckpointStore(Protocol):
 class MemoryCheckpointStore:
     def __init__(self) -> None:
         self._values: dict[str, YouTubeCheckpoint] = {}
+        self._reservation_guard = threading.Lock()
+        self._reservations: set[str] = set()
+
+    @contextmanager
+    def reserve(self, publication_id: str) -> Iterator[None]:
+        with self._reservation_guard:
+            if publication_id in self._reservations:
+                raise ConcurrentYouTubePublishError("A YouTube publish for this publication is already in progress.")
+            self._reservations.add(publication_id)
+        try:
+            yield
+        finally:
+            with self._reservation_guard:
+                self._reservations.remove(publication_id)
 
     def load(self, publication_id: str) -> YouTubeCheckpoint | None:
         return self._values.get(publication_id)
 
     def save(self, publication_id: str, checkpoint: YouTubeCheckpoint) -> None:
         self._values[publication_id] = checkpoint
+
+
+def _checkpoint_path(root: Path, publication_id: str) -> Path:
+    try:
+        parsed = UUID(publication_id)
+    except (AttributeError, TypeError, ValueError):
+        raise YouTubeCheckpointError("YouTube checkpoint publication ID is invalid.") from None
+    if str(parsed) != publication_id:
+        raise YouTubeCheckpointError("YouTube checkpoint publication ID is invalid.")
+    return root / f"{publication_id}.json"
+
+
+def _safe_session_reference(value: str) -> bool:
+    if len(value) > 4096:
+        return False
+    parsed = urlparse(value)
+    hostname = parsed.hostname or ""
+    try:
+        port = parsed.port
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return False
+    if set(query) - {"upload_id", "upload_protocol"}:
+        return False
+    upload_ids = query.get("upload_id", [])
+    upload_protocols = query.get("upload_protocol", [])
+    return (
+        parsed.scheme == "https"
+        and parsed.username is None
+        and parsed.password is None
+        and port in {None, 443}
+        and not parsed.fragment
+        and hostname in _SESSION_HOSTS
+        and parsed.path == "/upload/youtube/v3/videos"
+        and len(upload_ids) == 1
+        and _UPLOAD_ID.fullmatch(upload_ids[0]) is not None
+        and (not upload_protocols or upload_protocols == ["resumable"])
+    )
+
+
+def _validate_checkpoint_shape(checkpoint: YouTubeCheckpoint) -> None:
+    if type(checkpoint.provider_correlation) is not str or not _PROVIDER_CORRELATION.fullmatch(
+        checkpoint.provider_correlation
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if type(checkpoint.render_sha256) is not str or not _SHA256.fullmatch(checkpoint.render_sha256):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if type(checkpoint.metadata_sha256) is not str or not _SHA256.fullmatch(checkpoint.metadata_sha256):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if type(checkpoint.byte_count) is not int or checkpoint.byte_count <= 0:
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if type(checkpoint.creation_pending) is not bool:
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if type(checkpoint.next_offset) is not int or not 0 <= checkpoint.next_offset <= checkpoint.byte_count:
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if checkpoint.session_reference is not None and (
+        type(checkpoint.session_reference) is not str or not _safe_session_reference(checkpoint.session_reference)
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if checkpoint.video_id is not None and (
+        type(checkpoint.video_id) is not str or not _VIDEO_ID.fullmatch(checkpoint.video_id)
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if checkpoint.creation_pending and (
+        checkpoint.session_reference is not None or checkpoint.next_offset != 0 or checkpoint.video_id is not None
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if checkpoint.video_id is not None and (
+        checkpoint.creation_pending or checkpoint.next_offset != checkpoint.byte_count
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+    if (
+        checkpoint.video_id is None
+        and checkpoint.session_reference is None
+        and checkpoint.next_offset != 0
+    ):
+        raise YouTubeCheckpointError("YouTube checkpoint is malformed.")
+
+
+class FileCheckpointStore:
+    """Atomic, process-durable JSON checkpoints containing only non-secret upload state."""
+
+    _FIELDS = {
+        "byte_count",
+        "creation_pending",
+        "metadata_sha256",
+        "next_offset",
+        "provider_correlation",
+        "render_sha256",
+        "session_reference",
+        "video_id",
+    }
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        try:
+            self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError:
+            raise YouTubeCheckpointError("YouTube checkpoint directory is unavailable.") from None
+        if not self._root.is_dir() or self._root.is_symlink():
+            raise YouTubeCheckpointError("YouTube checkpoint directory is unavailable.")
+
+    @contextmanager
+    def reserve(self, publication_id: str) -> Iterator[None]:
+        _checkpoint_path(self._root, publication_id)
+        lock_path = self._root / f".{publication_id}.lock"
+        descriptor: int | None = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lock_path, flags, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ConcurrentYouTubePublishError(
+                    "A YouTube publish for this publication is already in progress."
+                ) from None
+            yield
+        except ConcurrentYouTubePublishError:
+            raise
+        except OSError:
+            raise YouTubeCheckpointError("YouTube checkpoint reservation is unavailable.") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+
+    def load(self, publication_id: str) -> YouTubeCheckpoint | None:
+        path = _checkpoint_path(self._root, publication_id)
+        if not path.exists():
+            if path.is_symlink():
+                raise YouTubeCheckpointError("YouTube durable checkpoint is malformed.")
+            return None
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024:
+                raise ValueError("unsafe checkpoint")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or set(payload) != self._FIELDS:
+                raise ValueError("invalid fields")
+            checkpoint = YouTubeCheckpoint(
+                provider_correlation=payload["provider_correlation"],
+                render_sha256=payload["render_sha256"],
+                metadata_sha256=payload["metadata_sha256"],
+                byte_count=payload["byte_count"],
+                creation_pending=payload["creation_pending"],
+                session_reference=payload["session_reference"],
+                next_offset=payload["next_offset"],
+                video_id=payload["video_id"],
+            )
+            _validate_checkpoint_shape(checkpoint)
+            return checkpoint
+        except YouTubeCheckpointError:
+            raise
+        except (KeyError, OSError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            raise YouTubeCheckpointError("YouTube durable checkpoint is malformed.") from None
+
+    def save(self, publication_id: str, checkpoint: YouTubeCheckpoint) -> None:
+        path = _checkpoint_path(self._root, publication_id)
+        _validate_checkpoint_shape(checkpoint)
+        payload = {
+            "byte_count": checkpoint.byte_count,
+            "creation_pending": checkpoint.creation_pending,
+            "metadata_sha256": checkpoint.metadata_sha256,
+            "next_offset": checkpoint.next_offset,
+            "provider_correlation": checkpoint.provider_correlation,
+            "render_sha256": checkpoint.render_sha256,
+            "session_reference": checkpoint.session_reference,
+            "video_id": checkpoint.video_id,
+        }
+        serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=self._root,
+                prefix=f".{publication_id}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+                target.write(serialized)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+            directory_descriptor = os.open(self._root, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError:
+            raise YouTubeCheckpointError("YouTube durable checkpoint could not be saved.") from None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
 
 class YouTubeGateway(Protocol):
@@ -357,16 +589,7 @@ class YouTubeHttpGateway:
 
     @staticmethod
     def _validate_session_reference(session_reference: str | None) -> None:
-        if not isinstance(session_reference, str):
-            raise YouTubeProcessingError("YouTube returned an invalid resumable session reference.")
-        parsed = urlparse(session_reference)
-        hostname = parsed.hostname or ""
-        if (
-            parsed.scheme != "https"
-            or parsed.username is not None
-            or parsed.password is not None
-            or not (hostname == "googleapis.com" or hostname.endswith(".googleapis.com"))
-        ):
+        if not isinstance(session_reference, str) or not _safe_session_reference(session_reference):
             raise YouTubeProcessingError("YouTube returned an invalid resumable session reference.")
 
     @staticmethod
@@ -424,6 +647,7 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
         chunk_size: int = 8 * 1024 * 1024,
         max_retries: int = 4,
         max_session_recreations: int = 2,
+        max_processing_retries: int = 4,
         max_processing_polls: int = 20,
         retry_delay: Callable[[float], Awaitable[None]] = asyncio.sleep,
         initial_backoff_seconds: float = 1.0,
@@ -432,7 +656,12 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
         super().__init__(approval_client)
         if chunk_size <= 0 or chunk_size % _CHUNK_GRANULARITY != 0:
             raise ValueError("YouTube non-final chunk size must be a positive multiple of 256 KiB.")
-        if max_retries < 0 or max_session_recreations < 0 or max_processing_polls <= 0:
+        if (
+            max_retries < 0
+            or max_session_recreations < 0
+            or max_processing_retries < 0
+            or max_processing_polls <= 0
+        ):
             raise ValueError("YouTube upload bounds are invalid.")
         if initial_backoff_seconds <= 0 or max_backoff_seconds < initial_backoff_seconds:
             raise ValueError("YouTube retry delays are invalid.")
@@ -442,12 +671,17 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
         self._chunk_size = chunk_size
         self._max_retries = max_retries
         self._max_session_recreations = max_session_recreations
+        self._max_processing_retries = max_processing_retries
         self._max_processing_polls = max_processing_polls
         self._retry_delay = retry_delay
         self._initial_backoff_seconds = initial_backoff_seconds
         self._max_backoff_seconds = max_backoff_seconds
 
     async def publish_approved(self, command: PublicationCommand, media_path: Path) -> YouTubePublishResult:
+        with self._checkpoints.reserve(command.publication_id):
+            return await self._publish_exclusive(command, media_path)
+
+    async def _publish_exclusive(self, command: PublicationCommand, media_path: Path) -> YouTubePublishResult:
         metadata = command.metadata.for_destination(self.destination)
         if not isinstance(metadata, YouTubeMetadata):
             raise ValueError("YouTube command requires YouTube metadata.")
@@ -460,10 +694,14 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
             checkpoint = self._checkpoints.load(command.publication_id)
             if checkpoint is not None:
                 self._validate_checkpoint(command, checkpoint, total_bytes)
+                if checkpoint.creation_pending:
+                    raise AmbiguousYouTubeCreationError(
+                        "YouTube session creation is ambiguous; manual recovery is required before retrying."
+                    )
 
             access_token = await self._gateway.exchange_refresh_token(self._credentials())
             if checkpoint is None:
-                checkpoint = self._bound_checkpoint(command, total_bytes, None, 0, None)
+                checkpoint = self._bound_checkpoint(command, total_bytes, False, None, 0, None)
             if checkpoint.video_id is None:
                 checkpoint = await self._upload(command, metadata, media, total_bytes, access_token, checkpoint)
 
@@ -600,12 +838,26 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
     ) -> str:
         value = metadata.wire_value()
         value.pop("destination", None)
-        return await self._gateway.create_session(
-            access_token=access_token,
-            byte_count=total_bytes,
-            correlation=command.provider_correlation,
-            metadata={"snippet": value, "status": {"privacyStatus": "private"}},
-        )
+        self._save(command, total_bytes, None, 0, None, creation_pending=True)
+        try:
+            session_reference = await self._gateway.create_session(
+                access_token=access_token,
+                byte_count=total_bytes,
+                correlation=command.provider_correlation,
+                metadata={"snippet": value, "status": {"privacyStatus": "private"}},
+            )
+        except (YouTubeAuthError, YouTubeQuotaError):
+            self._save(command, total_bytes, None, 0, None)
+            raise
+        except Exception:
+            raise AmbiguousYouTubeCreationError(
+                "YouTube session creation is ambiguous; manual recovery is required before retrying."
+            ) from None
+        if not _safe_session_reference(session_reference):
+            raise AmbiguousYouTubeCreationError(
+                "YouTube session creation is ambiguous; manual recovery is required before retrying."
+            )
+        return session_reference
 
     def _save(
         self,
@@ -614,10 +866,13 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
         session_reference: str | None,
         next_offset: int,
         video_id: str | None,
+        *,
+        creation_pending: bool = False,
     ) -> YouTubeCheckpoint:
         checkpoint = self._bound_checkpoint(
             command,
             total_bytes,
+            creation_pending,
             session_reference,
             next_offset,
             video_id,
@@ -629,6 +884,7 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
     def _bound_checkpoint(
         command: PublicationCommand,
         total_bytes: int,
+        creation_pending: bool,
         session_reference: str | None,
         next_offset: int,
         video_id: str | None,
@@ -638,6 +894,7 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
             render_sha256=command.render_sha256,
             metadata_sha256=command.metadata_sha256,
             byte_count=total_bytes,
+            creation_pending=creation_pending,
             session_reference=session_reference,
             next_offset=next_offset,
             video_id=video_id,
@@ -656,12 +913,7 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
             or checkpoint.byte_count != total_bytes
         ):
             raise YouTubeCheckpointError("YouTube checkpoint bindings do not match the publication command.")
-        if checkpoint.next_offset < 0 or checkpoint.next_offset > total_bytes:
-            raise YouTubeCheckpointError("YouTube checkpoint offset is invalid.")
-        if checkpoint.video_id is not None and checkpoint.next_offset != total_bytes:
-            raise YouTubeCheckpointError("Completed YouTube checkpoint offset is invalid.")
-        if checkpoint.video_id is None and checkpoint.session_reference is None and checkpoint.next_offset != 0:
-            raise YouTubeCheckpointError("YouTube checkpoint resumable state is invalid.")
+        _validate_checkpoint_shape(checkpoint)
 
     @staticmethod
     def _verify_media(media: BinaryIO) -> tuple[str, int]:
@@ -687,17 +939,42 @@ class YouTubeAdapter(ApprovalBoundPublicationAdapter):
     async def _wait_until_processed(self, access_token: str, video_id: str) -> YouTubePublishResult:
         if not _VIDEO_ID.fullmatch(video_id):
             raise YouTubeProcessingError("YouTube returned an invalid provider video ID.")
-        for poll in range(self._max_processing_polls):
-            status = await self._gateway.processing_status(access_token=access_token, video_id=video_id)
+        poll = 0
+        processing_retries = 0
+        while poll < self._max_processing_polls:
+            try:
+                status = await self._gateway.processing_status(access_token=access_token, video_id=video_id)
+            except RetryableYouTubeError:
+                if processing_retries >= self._max_processing_retries:
+                    raise RetryableYouTubeError("YouTube processing status retry bound was exhausted.") from None
+                processing_retries += 1
+                await self._retry_delay(self._backoff(processing_retries))
+                continue
+            poll += 1
             if status == "succeeded":
                 return YouTubePublishResult(video_id, f"https://studio.youtube.com/video/{video_id}/edit")
             if status in {"failed", "rejected", "terminated"}:
                 raise YouTubeProcessingError("YouTube could not process the private upload.")
             if status != "processing":
                 raise YouTubeProcessingError("YouTube returned an unknown processing state.")
-            if poll + 1 < self._max_processing_polls:
-                await self._retry_delay(self._backoff(poll + 1))
+            if poll < self._max_processing_polls:
+                await self._retry_delay(self._backoff(poll))
         raise YouTubeProcessingError("YouTube processing did not finish within the polling bound.")
 
 
-__all__ = ["YouTubeAuthError"]
+__all__ = [
+    "AmbiguousYouTubeCreationError",
+    "CheckpointStore",
+    "ConcurrentYouTubePublishError",
+    "FileCheckpointStore",
+    "YouTubeAdapter",
+    "YouTubeAuthError",
+    "YouTubeCheckpoint",
+    "YouTubeCheckpointError",
+    "YouTubeGateway",
+    "YouTubeHttpGateway",
+    "YouTubeIntegrityError",
+    "YouTubeProcessingError",
+    "YouTubePublishResult",
+    "YouTubeQuotaError",
+]

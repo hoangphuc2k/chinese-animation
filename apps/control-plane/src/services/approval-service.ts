@@ -53,6 +53,11 @@ interface VersionRow extends Record<string, unknown> {
   version: number;
 }
 
+interface JobStateRow extends Record<string, unknown> {
+  status: string;
+  version: number;
+}
+
 interface NextVersionRow extends Record<string, unknown> {
   version: number;
 }
@@ -131,8 +136,34 @@ export class ApprovalService {
       .bind(input.jobId, input.scriptVersion)
       .first<VersionRow>();
     if (!script || script.content_hash !== input.contentHash) throw new ApprovalMismatchError();
+    const latest = await this.database
+      .prepare("SELECT MAX(version) AS version FROM script_versions WHERE job_id = ?")
+      .bind(input.jobId)
+      .first<NextVersionRow>();
+    if (latest?.version !== input.scriptVersion) throw new ApprovalMismatchError();
+    const job = await this.database
+      .prepare("SELECT status, version FROM jobs WHERE id = ?")
+      .bind(input.jobId)
+      .first<JobStateRow>();
     const approvalId = this.newId();
+    // Approving the latest script releases a job waiting for review to voice generation.
+    const advance =
+      job?.status === "WAITING_SCRIPT_REVIEW"
+        ? [
+            this.database
+              .prepare(
+                "UPDATE jobs SET status = 'GENERATING_VOICE', step = 'GENERATING_VOICE', version = version + 1, available_at = ?, updated_at = ? WHERE id = ? AND status = 'WAITING_SCRIPT_REVIEW' AND version = ?",
+              )
+              .bind(input.nowUtc, input.nowUtc, input.jobId, job.version),
+            this.database
+              .prepare(
+                "INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, id, 'SCRIPT_APPROVED', 'WAITING_SCRIPT_REVIEW', 'GENERATING_VOICE', '{}', ? FROM jobs WHERE id = ? AND status = 'GENERATING_VOICE' AND version = ?",
+              )
+              .bind(this.newId(), input.nowUtc, input.jobId, job.version + 1),
+          ]
+        : [];
     await this.database.batch([
+      ...advance,
       this.database
         .prepare(
           "UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL",

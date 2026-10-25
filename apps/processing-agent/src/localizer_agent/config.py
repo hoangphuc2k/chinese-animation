@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
+from localizer_agent.control_plane import AccessServiceToken
+
 
 class ConfigurationError(ValueError):
     """Raised when the agent cannot start with a safe configuration."""
@@ -90,7 +92,7 @@ def _watermark_configuration(values: Mapping[str, str]) -> tuple[Path | None, st
 @dataclass(frozen=True, repr=False)
 class AgentConfig:
     control_plane_url: str
-    access_token: str = field(repr=False)
+    access_service_token: AccessServiceToken
     inbox_root: Path
     workspace_root: Path
     poll_interval_seconds: int = 5
@@ -121,7 +123,10 @@ class AgentConfig:
         azure_speech_endpoint, azure_speech_key, azure_speech_voice = _azure_speech_configuration(env)
         watermark_path, watermark_sha256 = _watermark_configuration(env)
         return cls(
-            access_token=_required(env, "AGENT_ACCESS_TOKEN"),
+            access_service_token=AccessServiceToken(
+                client_id=_required(env, "AGENT_ACCESS_CLIENT_ID"),
+                client_secret=_required(env, "AGENT_ACCESS_CLIENT_SECRET"),
+            ),
             azure_speech_endpoint=azure_speech_endpoint,
             azure_speech_key=azure_speech_key,
             azure_speech_voice=azure_speech_voice,

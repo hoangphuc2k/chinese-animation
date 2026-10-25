@@ -23,6 +23,7 @@ export interface AuthContext {
 
 interface AccessJwtClaims {
   aud?: unknown;
+  common_name?: unknown;
   email?: unknown;
   exp?: unknown;
   iss?: unknown;
@@ -54,7 +55,8 @@ export interface AccessAuthOptions extends CommonAuthOptions {
 }
 
 export interface AgentAuthOptions extends CommonAuthOptions {
-  serviceSubject: string;
+  /** Access service-token Client ID; Access puts it in the JWT `common_name` claim. */
+  serviceClientId: string;
 }
 
 interface ParsedJwt {
@@ -124,6 +126,8 @@ function requiredString(value: unknown, name: string): string {
 }
 
 function roleFromClaims(value: unknown): AccessRole {
+  // Access identity tokens carry no roles claim; the allowed email is the single administrator.
+  if (value === undefined) return "admin";
   if (!Array.isArray(value) || !value.every((role) => typeof role === "string")) {
     throw new AuthenticationError("roles claim is missing");
   }
@@ -228,8 +232,8 @@ export function createAgentAuthenticator(options: AgentAuthOptions): MiddlewareH
   return async (context, next) => {
     try {
       const claims = await verifier.verify(tokenFromRequest(context.req.raw));
-      const actorId = requiredString(claims.sub, "sub");
-      if (actorId !== options.serviceSubject) throw new AuthenticationError("service subject does not match");
+      const actorId = requiredString(claims.common_name, "common_name");
+      if (actorId !== options.serviceClientId) throw new AuthenticationError("service token Client ID does not match");
       context.set("auth", { actorId, kind: "agent", role: "agent" });
       await next();
     } catch {

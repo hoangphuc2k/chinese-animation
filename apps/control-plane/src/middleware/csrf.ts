@@ -1,4 +1,4 @@
-import type { MiddlewareHandler } from "hono";
+import type { Handler, MiddlewareHandler } from "hono";
 
 import type { AuthContext } from "./access-auth";
 
@@ -112,5 +112,13 @@ export function createCsrfProtector(options: CsrfProtectorOptions): MiddlewareHa
       return forbiddenResponse();
     }
     await next();
+  };
+}
+
+export function createCsrfTokenHandler(tokens: CsrfTokenService): Handler<{ Variables: AuthContext }> {
+  return async (context) => {
+    const identity = context.get("auth");
+    if (identity?.kind !== "browser") return forbiddenResponse();
+    return context.json({ token: await tokens.issue(identity.actorId) }, 200, { "cache-control": "no-store" });
   };
 }

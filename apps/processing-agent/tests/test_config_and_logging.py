@@ -8,10 +8,10 @@ from localizer_agent.config import AgentConfig, ConfigurationError
 from localizer_agent.structured_logging import create_logger
 
 
-def test_config_loads_required_values_without_exposing_the_bearer_token(tmp_path: Path) -> None:
+def test_config_loads_required_values_without_exposing_the_service_token_secret(tmp_path: Path) -> None:
     config = AgentConfig.from_env(
         {
-            "AGENT_ACCESS_TOKEN": "sensitive-token",
+            "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
             "CONTROL_PLANE_URL": "https://control-plane.example.test",
             "INBOX_ROOT": str(tmp_path / "inbox"),
             "WORKSPACE_ROOT": str(tmp_path / "workspace"),
@@ -21,6 +21,23 @@ def test_config_loads_required_values_without_exposing_the_bearer_token(tmp_path
     assert config.control_plane_url == "https://control-plane.example.test"
     assert config.workspace_root == tmp_path / "workspace"
     assert "sensitive-token" not in repr(config)
+    assert config.access_service_token.client_id == "agent-client.access"
+    assert "sensitive-token" not in repr(config.access_service_token)
+
+
+@pytest.mark.parametrize("missing", ["AGENT_ACCESS_CLIENT_ID", "AGENT_ACCESS_CLIENT_SECRET"])
+def test_config_requires_both_access_service_token_parts(tmp_path: Path, missing: str) -> None:
+    values = {
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access",
+        "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
+        "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "INBOX_ROOT": str(tmp_path / "inbox"),
+        "WORKSPACE_ROOT": str(tmp_path / "workspace"),
+    }
+    values.pop(missing)
+
+    with pytest.raises(ConfigurationError):
+        AgentConfig.from_env(values)
 
 
 @pytest.mark.parametrize("url", ["http://control-plane.example.test", "https://control-plane.example.test/path", "not-a-url"])
@@ -28,7 +45,7 @@ def test_config_requires_a_https_control_plane_origin(tmp_path: Path, url: str) 
     with pytest.raises(ConfigurationError):
         AgentConfig.from_env(
             {
-                "AGENT_ACCESS_TOKEN": "sensitive-token",
+                "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
                 "CONTROL_PLANE_URL": url,
                 "INBOX_ROOT": str(tmp_path / "inbox"),
                 "WORKSPACE_ROOT": str(tmp_path / "workspace"),
@@ -38,7 +55,7 @@ def test_config_requires_a_https_control_plane_origin(tmp_path: Path, url: str) 
 
 def test_config_enables_whisper_only_with_a_complete_pinned_toolchain(tmp_path: Path) -> None:
     values = {
-        "AGENT_ACCESS_TOKEN": "sensitive-token",
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
         "CONTROL_PLANE_URL": "https://control-plane.example.test",
         "INBOX_ROOT": str(tmp_path / "inbox"),
         "WHISPER_BINARY_PATH": str(tmp_path / "whisper-cli"),
@@ -59,7 +76,7 @@ def test_config_enables_whisper_only_with_a_complete_pinned_toolchain(tmp_path: 
 
 def test_config_enables_gemini_only_with_complete_provider_settings(tmp_path: Path) -> None:
     values = {
-        "AGENT_ACCESS_TOKEN": "sensitive-token",
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
         "CONTROL_PLANE_URL": "https://control-plane.example.test",
         "GEMINI_API_KEY": "gemini-secret",
         "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
@@ -80,7 +97,7 @@ def test_config_enables_gemini_only_with_complete_provider_settings(tmp_path: Pa
 
 def test_config_enables_azure_speech_only_with_complete_provider_settings(tmp_path: Path) -> None:
     values = {
-        "AGENT_ACCESS_TOKEN": "sensitive-token",
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
         "AZURE_SPEECH_ENDPOINT": "https://eastus.tts.speech.microsoft.com/cognitiveservices/v1",
         "AZURE_SPEECH_KEY": "azure-secret",
         "AZURE_SPEECH_VOICE": "vi-VN-HoaiMyNeural",
@@ -101,7 +118,7 @@ def test_config_enables_azure_speech_only_with_complete_provider_settings(tmp_pa
 
 def test_config_enables_rendering_only_with_a_pinned_watermark(tmp_path: Path) -> None:
     values = {
-        "AGENT_ACCESS_TOKEN": "sensitive-token", "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access", "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token", "CONTROL_PLANE_URL": "https://control-plane.example.test",
         "INBOX_ROOT": str(tmp_path / "inbox"), "WATERMARK_PATH": str(tmp_path / "watermark.png"),
         "WATERMARK_SHA256": "a" * 64, "WORKSPACE_ROOT": str(tmp_path / "workspace"),
     }

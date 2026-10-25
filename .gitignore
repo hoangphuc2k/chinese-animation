@@ -26,3 +26,6 @@ artifacts/
 cookies.txt
 client_secret*.json
 token*.json
+
+# Local stack media
+infra/local/inbox/

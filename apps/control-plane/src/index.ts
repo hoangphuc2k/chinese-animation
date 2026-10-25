@@ -3,8 +3,8 @@ import { Hono, type Context } from "hono";
 import { createAgentRoutes } from "./api/agent-routes";
 import { createBrowserWorkflowRoutes } from "./api/project-routes";
 import type { WorkerEnv } from "./env";
-import { createAccessAuthenticator, createAgentAuthenticator } from "./middleware/access-auth";
-import { createCsrfProtector, createCsrfTokenService } from "./middleware/csrf";
+import { createAccessAuthenticator, createAgentAuthenticator, type AuthContext } from "./middleware/access-auth";
+import { createCsrfProtector, createCsrfTokenHandler, createCsrfTokenService, type CsrfTokenService } from "./middleware/csrf";
 import { createStructuredLogger } from "./observability/logger";
 import { RetentionService } from "./scheduled/retention";
 import { LeaseService, type LeaseDatabase } from "./services/lease-service";
@@ -30,15 +30,16 @@ export const app = new Hono<{ Bindings: WorkerEnv }>();
 const agentAuthenticators = new Map<string, ReturnType<typeof createAgentAuthenticator>>();
 const browserAuthenticators = new Map<string, ReturnType<typeof createAccessAuthenticator>>();
 const csrfProtectors = new Map<string, ReturnType<typeof createCsrfProtector>>();
+const csrfTokenServices = new Map<string, CsrfTokenService>();
 
 function agentAuthenticator(env: WorkerEnv): ReturnType<typeof createAgentAuthenticator> {
-  const key = `${env.ACCESS_ISSUER}:${env.AGENT_ACCESS_AUDIENCE}:${env.AGENT_SERVICE_SUBJECT}`;
+  const key = `${env.ACCESS_ISSUER}:${env.AGENT_ACCESS_AUDIENCE}:${env.AGENT_SERVICE_CLIENT_ID}`;
   let authenticator = agentAuthenticators.get(key);
   if (!authenticator) {
     authenticator = createAgentAuthenticator({
       audience: env.AGENT_ACCESS_AUDIENCE,
       issuer: env.ACCESS_ISSUER,
-      serviceSubject: env.AGENT_SERVICE_SUBJECT,
+      serviceClientId: env.AGENT_SERVICE_CLIENT_ID,
     });
     agentAuthenticators.set(key, authenticator);
   }
@@ -59,14 +60,20 @@ function browserAuthenticator(env: WorkerEnv): ReturnType<typeof createAccessAut
   return authenticator;
 }
 
+function csrfTokenService(env: WorkerEnv): CsrfTokenService {
+  let tokens = csrfTokenServices.get(env.CSRF_SIGNING_SECRET);
+  if (!tokens) {
+    tokens = createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET });
+    csrfTokenServices.set(env.CSRF_SIGNING_SECRET, tokens);
+  }
+  return tokens;
+}
+
 function csrfProtector(env: WorkerEnv): ReturnType<typeof createCsrfProtector> {
-  const key = `${env.PREVIEW_ORIGIN}:${env.CSRF_SIGNING_SECRET}`;
+  const key = `${env.ADMIN_ORIGIN}:${env.CSRF_SIGNING_SECRET}`;
   let protector = csrfProtectors.get(key);
   if (!protector) {
-    protector = createCsrfProtector({
-      origin: env.PREVIEW_ORIGIN,
-      tokens: createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET }),
-    });
+    protector = createCsrfProtector({ origin: env.ADMIN_ORIGIN, tokens: csrfTokenService(env) });
     csrfProtectors.set(key, protector);
   }
   return protector;
@@ -80,6 +87,12 @@ app.get("/api/v1/health", (context) => {
     requestId,
     status: "ok",
   });
+});
+
+app.get("/api/v1/session/csrf-token", (context) => {
+  const routes = new Hono<{ Variables: AuthContext }>();
+  routes.get("*", browserAuthenticator(context.env), createCsrfTokenHandler(csrfTokenService(context.env)));
+  return routes.fetch(context.req.raw);
 });
 
 app.all("/api/v1/agent/*", async (context) => {

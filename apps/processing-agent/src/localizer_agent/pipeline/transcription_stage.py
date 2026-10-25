@@ -12,7 +12,7 @@ from localizer_agent.lease import LeaseGuard
 from localizer_agent.pipeline.lineage import ArtifactRecord, StageKey
 from localizer_agent.pipeline.runner import StageResult, StageRunner
 from localizer_agent.transcription.segments import TranscriptSegment
-from localizer_agent.transcription.whisper_cpp import TranscriptArtifact
+from localizer_agent.transcription.whisper_cpp import TranscriptArtifact, json_output_path
 from localizer_agent.workspace import JobWorkspace, JobWorkspaceManager
 
 
@@ -220,4 +220,4 @@ class TranscriptionHandler:
                 )
             return result, transcript
         finally:
-            output_prefix.with_suffix(".json").unlink(missing_ok=True)
+            json_output_path(output_prefix).unlink(missing_ok=True)

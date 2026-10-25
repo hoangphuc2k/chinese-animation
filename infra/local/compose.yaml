@@ -1,0 +1,119 @@
+# Local end-to-end stack. Not for deployment: it replaces Cloudflare Access,
+# Gemini and Azure Speech with local fakes. See infra/local/README.md.
+name: localizer-local
+
+x-local-identity: &local-identity
+  ACCESS_ISSUER: http://access-edge:9000
+  ADMIN_AUDIENCE: local-admin-audience
+  ADMIN_EMAIL: admin@localizer.local
+  AGENT_AUDIENCE: local-agent-audience
+  AGENT_CLIENT_ID: local-agent.access
+  AGENT_CLIENT_SECRET: local-agent-secret-not-for-production
+
+services:
+  certs:
+    image: alpine:3.20
+    command: ["/bin/sh", "/scripts/generate-certs.sh", "/certs"]
+    volumes:
+      - ./generate-certs.sh:/scripts/generate-certs.sh:ro
+      - certs:/certs
+
+  access-edge:
+    image: node:24-alpine
+    command: ["node", "/app/server.mjs"]
+    environment:
+      <<: *local-identity
+      UPSTREAM: http://control-plane:8787
+    volumes:
+      - ./access-edge/server.mjs:/app/server.mjs:ro
+      - certs:/certs:ro
+    ports:
+      - "127.0.0.1:8443:443"
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    networks:
+      default:
+        aliases: [control-plane.local]
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: infra/local/control-plane.Dockerfile
+    environment:
+      <<: *local-identity
+      ADMIN_ORIGIN: https://control-plane.local
+      CSRF_SIGNING_SECRET: local-csrf-secret-not-for-production
+    volumes:
+      - control-plane-state:/state
+
+  fake-providers:
+    image: node:24-alpine
+    command: ["node", "/app/server.mjs"]
+    environment:
+      FAKE_AZURE_KEY: local-azure-key
+      FAKE_GEMINI_KEY: local-gemini-key
+    volumes:
+      - ./fake-providers/server.mjs:/app/server.mjs:ro
+      - certs:/certs:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    networks:
+      default:
+        aliases: [providers.local]
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: infra/local/agent.Dockerfile
+    environment:
+      AGENT_ACCESS_CLIENT_ID: local-agent.access
+      AGENT_ACCESS_CLIENT_SECRET: local-agent-secret-not-for-production
+      AZURE_SPEECH_ENDPOINT: https://providers.local/cognitiveservices/v1
+      AZURE_SPEECH_KEY: local-azure-key
+      AZURE_SPEECH_VOICE: vi-VN-HoaiMyNeural
+      CONTROL_PLANE_URL: https://control-plane.local
+      GEMINI_API_KEY: local-gemini-key
+      GEMINI_BASE_URL: https://providers.local/v1beta
+      GEMINI_MODEL_ID: fake-gemini
+      INBOX_ROOT: /var/lib/localizer-agent/inbox
+      MINIMUM_FREE_BYTES: "1073741824"
+      POLL_INTERVAL_SECONDS: "2"
+      SSL_CERT_FILE: /certs/ca.pem
+      WATERMARK_PATH: /opt/localizer/assets/watermark.png
+      WHISPER_BINARY_PATH: /opt/localizer/bin/whisper-cli
+      WHISPER_MODEL_PATH: /opt/localizer/models/ggml-small-q5_1.bin
+      WORKSPACE_ROOT: /var/lib/localizer-agent/workspace
+    volumes:
+      - ./inbox:/var/lib/localizer-agent/inbox:ro
+      - agent-workspace:/var/lib/localizer-agent/workspace
+      - certs:/certs:ro
+    depends_on:
+      access-edge:
+        condition: service_started
+      control-plane:
+        condition: service_healthy
+      fake-providers:
+        condition: service_started
+
+  smoke:
+    image: node:24-alpine
+    profiles: [smoke]
+    command: ["node", "/app/smoke.mjs"]
+    environment:
+      ADMIN_ORIGIN: https://control-plane.local
+      BASE_URL: https://control-plane.local
+      INBOX_FILE_ID: ${INBOX_FILE_ID:-sample-zh.mp4}
+      NODE_EXTRA_CA_CERTS: /certs/ca.pem
+    volumes:
+      - ./smoke.mjs:/app/smoke.mjs:ro
+      - certs:/certs:ro
+    depends_on:
+      agent:
+        condition: service_started
+
+volumes:
+  agent-workspace:
+  certs:
+  control-plane-state:

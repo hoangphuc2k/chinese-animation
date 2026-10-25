@@ -38,7 +38,7 @@ async def run() -> None:
     recovered = workspace_manager.recover()
     if recovered:
         logger.info("workspace_recovery_detected", recovered_job_count=len(recovered))
-    client = AgentControlPlaneClient(config.control_plane_url, config.access_token, request_timeout_seconds=config.request_timeout_seconds)
+    client = AgentControlPlaneClient(config.control_plane_url, config.access_service_token, request_timeout_seconds=config.request_timeout_seconds)
     import_supervisor = ImportSupervisor(
         client,
         workspace_manager,

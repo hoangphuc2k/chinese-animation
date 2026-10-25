@@ -43,7 +43,7 @@ async function requestJson(request: Request): Promise<unknown> {
 export function createAgentRoutes(options: AgentRoutesOptions): Hono<{ Variables: AuthContext }> {
   const routes = new Hono<{ Variables: AuthContext }>();
   const nowUtc = options.nowUtc ?? (() => new Date().toISOString());
-  const requestId = options.requestId ?? crypto.randomUUID;
+  const requestId = options.requestId ?? (() => crypto.randomUUID());
 
   routes.use("*", options.authenticate);
   routes.use("*", async (context, next) => {
