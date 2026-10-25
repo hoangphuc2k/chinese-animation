@@ -218,6 +218,7 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
           const jobId = ids();
           await jobs.createImport({
             actorId: identity.actorId,
+            allowedProcessors: body.data.allowedProcessors,
             actorType: identity.role,
             jobId,
             nowUtc: nowUtc(),

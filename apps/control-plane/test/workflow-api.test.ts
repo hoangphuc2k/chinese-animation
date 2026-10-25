@@ -1,80 +1,20 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import { app } from "../src/index";
 import type { AuthContext } from "../src/middleware/access-auth";
+import { createSqliteD1, type SqliteD1 } from "./sqlite-d1";
 import { createTestEnv } from "./worker-harness";
 
-const controlPlaneDirectory = fileURLToPath(new URL("../", import.meta.url));
 const projectId = "00000000-0000-4000-8000-000000000001";
 const projectIdTwo = "00000000-0000-4000-8000-000000000002";
 const databases: DatabaseSync[] = [];
 
-function sqliteInputValues(values: unknown[]): Array<bigint | null | number | string> {
-  return values.map((value) => {
-    if (value === null || typeof value === "bigint" || typeof value === "number" || typeof value === "string") return value;
-    throw new TypeError("The SQLite test adapter only accepts scalar D1 bind values.");
-  });
-}
-
-class SqliteStatement {
-  private values: unknown[] = [];
-
-  constructor(
-    private readonly database: DatabaseSync,
-    private readonly sql: string,
-  ) {}
-
-  bind(...values: unknown[]): this {
-    this.values = values;
-    return this;
-  }
-
-  async all<Row extends Record<string, unknown>>(): Promise<{ results: Row[] }> {
-    return { results: this.database.prepare(this.sql).all(...sqliteInputValues(this.values)) as Row[] };
-  }
-
-  async first<Row extends Record<string, unknown>>(): Promise<Row | null> {
-    return (this.database.prepare(this.sql).get(...sqliteInputValues(this.values)) as Row | undefined) ?? null;
-  }
-
-  async run<Row extends Record<string, unknown>>(): Promise<{ meta: { changes: number }; results: Row[] }> {
-    const result = this.database.prepare(this.sql).run(...sqliteInputValues(this.values));
-    return { meta: { changes: Number(result.changes) }, results: [] };
-  }
-}
-
-class SqliteD1 {
-  constructor(readonly sqlite: DatabaseSync) {}
-
-  prepare(sql: string): SqliteStatement {
-    return new SqliteStatement(this.sqlite, sql);
-  }
-
-  async batch(statements: SqliteStatement[]): Promise<Array<{ meta: { changes: number }; results: Record<string, unknown>[] }>> {
-    this.sqlite.exec("BEGIN");
-    try {
-      const results = await Promise.all(statements.map((statement) => statement.run()));
-      this.sqlite.exec("COMMIT");
-      return results;
-    } catch (error) {
-      this.sqlite.exec("ROLLBACK");
-      throw error;
-    }
-  }
-}
-
 function createDatabase(): SqliteD1 {
-  const database = new DatabaseSync(":memory:");
-  databases.push(database);
-  for (const migration of ["0001_initial.sql", "0002_workflow_versions_and_request_hashes.sql"]) {
-    database.exec(readFileSync(resolve(controlPlaneDirectory, "db/migrations", migration), "utf8"));
-  }
-  return new SqliteD1(database);
+  const database = createSqliteD1(["0001_initial.sql", "0002_workflow_versions_and_request_hashes.sql"]);
+  databases.push(database.sqlite);
+  return database;
 }
 
 function authenticatedBrowser(role: "admin" | "operator" | "reviewer" = "operator") {
@@ -312,6 +252,68 @@ describe("browser workflow API", () => {
       ],
       nextCursor: null,
     });
+  });
+
+  it("advances a job waiting for script review to voice generation only for the latest script version", async () => {
+    const database = createDatabase();
+    const operator = createRoutes([projectId], "operator", database);
+    const reviewer = createRoutes([], "reviewer", database);
+    await operator.request("https://control.example.test/projects", {
+      body: JSON.stringify({ name: "Review project" }),
+      headers: { "content-type": "application/json", "idempotency-key": "create-review-project" },
+      method: "POST",
+    });
+    const imported = await operator.request(`https://control.example.test/projects/${projectId}/imports`, {
+      body: JSON.stringify({
+        allowedProcessors: ["GOOGLE_GEMINI"],
+        locator: { kind: "OCI_INBOX_FILE", inboxFileId: "episode-2.mp4" },
+        rightsEvidence: "creator permission record 2026-08-04",
+      }),
+      headers: { "content-type": "application/json", "idempotency-key": "import-review-job" },
+      method: "POST",
+    });
+    const { jobId } = (await imported.json()) as { jobId: string };
+    const rights = database.sqlite
+      .prepare("SELECT rights_metadata_json FROM source_assets WHERE id = (SELECT source_asset_id FROM jobs WHERE id = ?)")
+      .get(jobId) as { rights_metadata_json: string };
+    expect(JSON.parse(rights.rights_metadata_json)).toMatchObject({ allowedProcessors: ["GOOGLE_GEMINI"] });
+    for (const [key, hash] of [
+      ["review-edit-1", "a".repeat(64)],
+      ["review-edit-2", "b".repeat(64)],
+    ] as const) {
+      await operator.request(`https://control.example.test/jobs/${jobId}/scripts`, {
+        body: JSON.stringify({ contentHash: hash, transcriptHash: "c".repeat(64) }),
+        headers: { "content-type": "application/json", "idempotency-key": key },
+        method: "POST",
+      });
+    }
+    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', step = 'WAITING_SCRIPT_REVIEW' WHERE id = ?").run(jobId);
+    const versionBefore = (database.sqlite.prepare("SELECT version FROM jobs WHERE id = ?").get(jobId) as { version: number }).version;
+
+    const superseded = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: "a".repeat(64), jobId, scriptVersion: 1 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-superseded" },
+      method: "POST",
+    });
+    expect(superseded.status).toBe(409);
+    expect(database.sqlite.prepare("SELECT status FROM jobs WHERE id = ?").get(jobId)).toMatchObject({ status: "WAITING_SCRIPT_REVIEW" });
+
+    const approved = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: "b".repeat(64), jobId, scriptVersion: 2 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-latest" },
+      method: "POST",
+    });
+    expect(approved.status).toBe(202);
+    expect(database.sqlite.prepare("SELECT status, step, version FROM jobs WHERE id = ?").get(jobId)).toMatchObject({
+      status: "GENERATING_VOICE",
+      step: "GENERATING_VOICE",
+      version: versionBefore + 1,
+    });
+    expect(
+      database.sqlite
+        .prepare("SELECT event_type, previous_state, next_state FROM job_events WHERE job_id = ? AND next_state = 'GENERATING_VOICE'")
+        .all(jobId),
+    ).toEqual([{ event_type: "SCRIPT_APPROVED", next_state: "GENERATING_VOICE", previous_state: "WAITING_SCRIPT_REVIEW" }]);
   });
 
   it("binds publish approval to an immutable render and exposes only an opaque preview descriptor", async () => {

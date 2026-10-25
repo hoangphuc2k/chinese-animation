@@ -394,7 +394,32 @@ export class LeaseService {
           input.nextState,
           input.jobVersion + 1,
         ),
+      ...this.scriptVersionStatements(input),
     ]);
     if (results[0]?.meta?.changes !== 1) throw new LeaseInvalidError();
+  }
+
+  /** A translated script becomes the next reviewable script version once its completion is accepted. */
+  private scriptVersionStatements(input: CompleteLeaseInput): LeaseStatement[] {
+    const script = input.pipelineArtifacts?.find((artifact) => artifact.kind === "SCRIPT");
+    if (input.nextState !== "WAITING_SCRIPT_REVIEW" || !script) return [];
+    return [
+      this.database
+        .prepare(
+          "INSERT INTO script_versions (id, job_id, version, content_hash, transcript_hash, translation_hash, metadata_hash, voice_settings_hash, created_at) SELECT ?, ?, COALESCE((SELECT MAX(version) FROM script_versions WHERE job_id = ?), 0) + 1, ?, (SELECT json_extract(artifact.value, '$.sha256') FROM jobs, json_tree(jobs.pipeline_lineage_json) AS artifact WHERE jobs.id = ? AND artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'TRANSCRIPT' ORDER BY artifact.id DESC LIMIT 1), ?, NULL, NULL, ? WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = ? AND version = ? AND lease_owner IS NULL)",
+        )
+        .bind(
+          this.newId(),
+          input.jobId,
+          input.jobId,
+          script.sha256,
+          input.jobId,
+          script.sha256,
+          input.nowUtc,
+          input.jobId,
+          input.nextState,
+          input.jobVersion + 1,
+        ),
+    ];
   }
 }

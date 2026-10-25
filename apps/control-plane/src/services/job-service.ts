@@ -46,6 +46,7 @@ export interface TransitionDestinationInput {
 
 export interface CreateImportJobInput {
   actorId: string;
+  allowedProcessors: readonly string[];
   actorType: string;
   jobId: string;
   nowUtc: string;
@@ -109,7 +110,7 @@ export class JobService {
           input.sourceMetadataJson,
           sourceContentHash,
           0,
-          JSON.stringify({ evidenceHash: rightsEvidenceHash }),
+          JSON.stringify({ allowedProcessors: [...new Set(input.allowedProcessors)].sort(), evidenceHash: rightsEvidenceHash }),
           null,
           input.nowUtc,
         ),
