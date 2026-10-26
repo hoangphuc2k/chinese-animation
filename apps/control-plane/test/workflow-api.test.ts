@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import { app } from "../src/index";
 import type { AuthContext } from "../src/middleware/access-auth";
+import { createCsrfTokenService } from "../src/middleware/csrf";
 import { createTestEnv } from "./worker-harness";
 
 const controlPlaneDirectory = fileURLToPath(new URL("../", import.meta.url));
@@ -119,6 +120,22 @@ describe("browser workflow API", () => {
     const response = await app.fetch(new Request("https://control.example.test/api/v1/projects"), createTestEnv());
 
     expect(response.status).toBe(401);
+  });
+
+  it("issues a CSRF token bound to the verified browser identity", async () => {
+    const tokens = createCsrfTokenService({ secret: "test-csrf-secret" });
+    const routes = createBrowserWorkflowRoutes({
+      authenticate: authenticatedBrowser("admin"),
+      csrf: noCsrf(),
+      csrfTokens: tokens,
+      database: createDatabase(),
+    });
+
+    const response = await routes.request("https://control.example.test/csrf-token");
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { csrfToken: string };
+    await expect(tokens.verify(body.csrfToken, "operator-1")).resolves.toBe(true);
   });
 
   it("creates projects and exposes stable, bounded project pagination and detail", async () => {

@@ -23,10 +23,10 @@ export interface AuthContext {
 
 interface AccessJwtClaims {
   aud?: unknown;
+  common_name?: unknown;
   email?: unknown;
   exp?: unknown;
   iss?: unknown;
-  roles?: unknown;
   sub?: unknown;
 }
 
@@ -54,7 +54,7 @@ export interface AccessAuthOptions extends CommonAuthOptions {
 }
 
 export interface AgentAuthOptions extends CommonAuthOptions {
-  serviceSubject: string;
+  serviceClientId: string;
 }
 
 interface ParsedJwt {
@@ -121,16 +121,6 @@ function audienceMatches(value: unknown, expected: string): boolean {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value) throw new AuthenticationError(`${name} claim is missing`);
   return value;
-}
-
-function roleFromClaims(value: unknown): AccessRole {
-  if (!Array.isArray(value) || !value.every((role) => typeof role === "string")) {
-    throw new AuthenticationError("roles claim is missing");
-  }
-  if (value.includes("admin")) return "admin";
-  if (value.includes("reviewer")) return "reviewer";
-  if (value.includes("operator")) return "operator";
-  throw new AuthenticationError("roles claim has no authorized role");
 }
 
 function defaultJwksUrl(issuer: string): string {
@@ -214,7 +204,7 @@ export function createAccessAuthenticator(options: AccessAuthOptions): Middlewar
         actorId: requiredString(claims.sub, "sub"),
         email,
         kind: "browser",
-        role: roleFromClaims(claims.roles),
+        role: "admin",
       });
       await next();
     } catch {
@@ -228,8 +218,10 @@ export function createAgentAuthenticator(options: AgentAuthOptions): MiddlewareH
   return async (context, next) => {
     try {
       const claims = await verifier.verify(tokenFromRequest(context.req.raw));
-      const actorId = requiredString(claims.sub, "sub");
-      if (actorId !== options.serviceSubject) throw new AuthenticationError("service subject does not match");
+      // Access service-token JWTs carry the client ID in common_name and an empty sub.
+      if (claims.sub !== "") throw new AuthenticationError("JWT is not a service-token identity");
+      const actorId = requiredString(claims.common_name, "common_name");
+      if (actorId !== options.serviceClientId) throw new AuthenticationError("service client ID does not match");
       context.set("auth", { actorId, kind: "agent", role: "agent" });
       await next();
     } catch {

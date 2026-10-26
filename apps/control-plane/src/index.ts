@@ -4,7 +4,7 @@ import { createAgentRoutes } from "./api/agent-routes";
 import { createBrowserWorkflowRoutes } from "./api/project-routes";
 import type { WorkerEnv } from "./env";
 import { createAccessAuthenticator, createAgentAuthenticator } from "./middleware/access-auth";
-import { createCsrfProtector, createCsrfTokenService } from "./middleware/csrf";
+import { createCsrfProtector, createCsrfTokenService, type CsrfTokenService } from "./middleware/csrf";
 import { createStructuredLogger } from "./observability/logger";
 import { RetentionService } from "./scheduled/retention";
 import { LeaseService, type LeaseDatabase } from "./services/lease-service";
@@ -29,16 +29,16 @@ function problemResponse(problem: ProblemDetails): Response {
 export const app = new Hono<{ Bindings: WorkerEnv }>();
 const agentAuthenticators = new Map<string, ReturnType<typeof createAgentAuthenticator>>();
 const browserAuthenticators = new Map<string, ReturnType<typeof createAccessAuthenticator>>();
-const csrfProtectors = new Map<string, ReturnType<typeof createCsrfProtector>>();
+const csrfProtectors = new Map<string, WorkerCsrf>();
 
 function agentAuthenticator(env: WorkerEnv): ReturnType<typeof createAgentAuthenticator> {
-  const key = `${env.ACCESS_ISSUER}:${env.AGENT_ACCESS_AUDIENCE}:${env.AGENT_SERVICE_SUBJECT}`;
+  const key = `${env.ACCESS_ISSUER}:${env.AGENT_ACCESS_AUDIENCE}:${env.AGENT_SERVICE_CLIENT_ID}`;
   let authenticator = agentAuthenticators.get(key);
   if (!authenticator) {
     authenticator = createAgentAuthenticator({
       audience: env.AGENT_ACCESS_AUDIENCE,
       issuer: env.ACCESS_ISSUER,
-      serviceSubject: env.AGENT_SERVICE_SUBJECT,
+      serviceClientId: env.AGENT_SERVICE_CLIENT_ID,
     });
     agentAuthenticators.set(key, authenticator);
   }
@@ -59,17 +59,20 @@ function browserAuthenticator(env: WorkerEnv): ReturnType<typeof createAccessAut
   return authenticator;
 }
 
-function csrfProtector(env: WorkerEnv): ReturnType<typeof createCsrfProtector> {
-  const key = `${env.PREVIEW_ORIGIN}:${env.CSRF_SIGNING_SECRET}`;
-  let protector = csrfProtectors.get(key);
-  if (!protector) {
-    protector = createCsrfProtector({
-      origin: env.PREVIEW_ORIGIN,
-      tokens: createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET }),
-    });
-    csrfProtectors.set(key, protector);
+interface WorkerCsrf {
+  protector: ReturnType<typeof createCsrfProtector>;
+  tokens: CsrfTokenService;
+}
+
+export function workerCsrf(env: WorkerEnv): WorkerCsrf {
+  const key = `${env.ADMIN_ORIGIN}:${env.CSRF_SIGNING_SECRET}`;
+  let csrf = csrfProtectors.get(key);
+  if (!csrf) {
+    const tokens = createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET });
+    csrf = { protector: createCsrfProtector({ origin: env.ADMIN_ORIGIN, tokens }), tokens };
+    csrfProtectors.set(key, csrf);
   }
-  return protector;
+  return csrf;
 }
 
 app.get("/api/v1/health", (context) => {
@@ -94,9 +97,11 @@ app.all("/api/v1/agent/*", async (context) => {
 });
 
 async function browserWorkflowResponse(context: Context<{ Bindings: WorkerEnv }>): Promise<Response> {
+  const csrf = workerCsrf(context.env);
   const routes = createBrowserWorkflowRoutes({
     authenticate: browserAuthenticator(context.env),
-    csrf: csrfProtector(context.env),
+    csrf: csrf.protector,
+    csrfTokens: csrf.tokens,
     database: context.env.CONTROL_PLANE_DB,
   });
   const url = new URL(context.req.url);
@@ -105,6 +110,7 @@ async function browserWorkflowResponse(context: Context<{ Bindings: WorkerEnv }>
 }
 
 for (const path of [
+  "/api/v1/csrf-token",
   "/api/v1/projects",
   "/api/v1/projects/:projectId",
   "/api/v1/projects/:projectId/imports",

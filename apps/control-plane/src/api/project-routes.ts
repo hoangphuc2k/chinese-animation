@@ -5,6 +5,7 @@ import { CreateImportRequest } from "../../../../packages/contracts/src/ingest";
 import { ProcessingState } from "../../../../packages/contracts/src/states";
 import type { AuthContext } from "../middleware/access-auth";
 import { Action, authorize } from "../middleware/authorize";
+import type { CsrfTokenService } from "../middleware/csrf";
 import { createRepositories } from "../repositories";
 import type { JobEventRow } from "../repositories/job-events";
 import type { ProjectRow } from "../repositories/projects";
@@ -32,6 +33,7 @@ type BrowserWorkflowVariables = { Variables: AuthContext };
 export interface BrowserWorkflowRoutesOptions {
   authenticate: MiddlewareHandler<BrowserWorkflowVariables>;
   csrf: MiddlewareHandler<BrowserWorkflowVariables>;
+  csrfTokens?: CsrfTokenService;
   database: SqlDatabase & WorkflowDatabase;
   newId?: () => string;
   nowUtc?: () => string;
@@ -135,6 +137,14 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
 
   routes.use("*", options.authenticate);
   routes.use("*", options.csrf);
+
+  routes.get("/csrf-token", async (context) => {
+    const identity = context.get("auth");
+    if (!identity || identity.kind !== "browser" || !options.csrfTokens) {
+      return problem("FORBIDDEN", "Browser identity is required.", requestId(), 403);
+    }
+    return context.json({ csrfToken: await options.csrfTokens.issue(identity.actorId) });
+  });
 
   routes.post("/projects", authorize(Action.CreateImport), async (context) => {
     const body = CreateProjectRequest.safeParse(await requestJson(context.req.raw));
