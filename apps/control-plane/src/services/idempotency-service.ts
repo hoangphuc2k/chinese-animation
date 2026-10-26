@@ -4,18 +4,21 @@ export interface StoredIdempotencyResult {
   responseStatus: number;
 }
 
+export interface IdempotencyKeyInput {
+  actorId: string;
+  idempotencyKey: string;
+  operation: string;
+}
+
+/** A reserved key whose mutation has not finished yet stores this response status. */
+export const PENDING_RESPONSE_STATUS = 0;
+
 export interface IdempotencyStore {
-  create(input: {
-    actorId: string;
-    createdAtUtc: string;
-    id: string;
-    idempotencyKey: string;
-    operation: string;
-    requestHash: string;
-    responseBody: unknown;
-    responseStatus: number;
-  }): Promise<void>;
-  find(input: { actorId: string; idempotencyKey: string; operation: string }): Promise<StoredIdempotencyResult | null>;
+  /** Atomically claims the key; returns false when any record (pending or finished) already holds it. */
+  reserve(input: IdempotencyKeyInput & { createdAtUtc: string; id: string; requestHash: string }): Promise<boolean>;
+  complete(input: IdempotencyKeyInput & { responseBody: unknown; responseStatus: number }): Promise<void>;
+  release(input: IdempotencyKeyInput): Promise<void>;
+  find(input: IdempotencyKeyInput): Promise<StoredIdempotencyResult | null>;
 }
 
 export interface IdempotentMutationInput {
@@ -41,20 +44,20 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+export class IdempotencyInProgressError extends IdempotencyConflictError {
+  constructor() {
+    super();
+    this.message = "A request with this Idempotency-Key is still in progress; retry later.";
+  }
+}
+
 export function createIdempotencyStore(repository: IdempotencyRepository): IdempotencyStore {
   return {
-    async create(input) {
-      await repository.create({
-        actorId: input.actorId,
-        createdAtUtc: input.createdAtUtc,
-        id: input.id,
-        idempotencyKey: input.idempotencyKey,
-        operation: input.operation,
-        requestHash: input.requestHash,
-        responseJson: JSON.stringify(input.responseBody),
-        responseStatus: input.responseStatus,
-      });
+    reserve: (input) => repository.reserve(input),
+    async complete(input) {
+      await repository.complete({ ...input, responseJson: JSON.stringify(input.responseBody) });
     },
+    release: (input) => repository.release(input),
     async find(input) {
       const record = await repository.find(input);
       if (!record) return null;
@@ -71,7 +74,7 @@ export function createIdempotencyStore(repository: IdempotencyRepository): Idemp
   };
 }
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new TypeError("Mutation body must use finite numbers.");
@@ -106,22 +109,22 @@ export class IdempotencyService {
   ): Promise<IdempotentMutationResponse> {
     if (!input.idempotencyKey) throw new TypeError("Idempotency-Key is required.");
     const requestHash = await sha256(canonicalJson({ actorId: input.actorId, body: input.body, route: input.route }));
-    const existing = await this.store.find(input);
-    if (existing) {
-      if (existing.requestHash !== requestHash) throw new IdempotencyConflictError();
+    const key = { actorId: input.actorId, idempotencyKey: input.idempotencyKey, operation: input.operation };
+    const reserved = await this.store.reserve({ ...key, createdAtUtc: this.nowUtc(), id: this.newId(), requestHash });
+    if (!reserved) {
+      const existing = await this.store.find(key);
+      if (existing && existing.requestHash !== requestHash) throw new IdempotencyConflictError();
+      if (!existing || existing.responseStatus === PENDING_RESPONSE_STATUS) throw new IdempotencyInProgressError();
       return { body: existing.responseBody, replayed: true, status: existing.responseStatus };
     }
-    const response = await mutation();
-    await this.store.create({
-      actorId: input.actorId,
-      createdAtUtc: this.nowUtc(),
-      id: this.newId(),
-      idempotencyKey: input.idempotencyKey,
-      operation: input.operation,
-      requestHash,
-      responseBody: response.body,
-      responseStatus: response.status,
-    });
+    let response: MutationResponse;
+    try {
+      response = await mutation();
+    } catch (error) {
+      await this.store.release(key);
+      throw error;
+    }
+    await this.store.complete({ ...key, responseBody: response.body, responseStatus: response.status });
     return { ...response, replayed: false };
   }
 }

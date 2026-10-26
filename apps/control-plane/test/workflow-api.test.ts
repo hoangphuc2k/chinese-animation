@@ -154,9 +154,10 @@ describe("browser workflow API", () => {
 
     expect(imported.status).toBe(202);
     const importBody = (await imported.json()) as { jobId: string; sourceVideoId: string; state: string };
+    // Idempotency records use internal random IDs, so the import draws the next two domain IDs.
     expect(importBody).toEqual({
-      jobId: "00000000-0000-4000-8000-000000000012",
-      sourceVideoId: "00000000-0000-4000-8000-000000000011",
+      jobId: "00000000-0000-4000-8000-000000000011",
+      sourceVideoId: "00000000-0000-4000-8000-000000000010",
       state: "QUEUED",
     });
 

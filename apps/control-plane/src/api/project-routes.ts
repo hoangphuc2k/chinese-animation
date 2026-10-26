@@ -140,7 +140,7 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
   const ids = options.newId ?? (() => crypto.randomUUID());
   const nowUtc = options.nowUtc ?? (() => new Date().toISOString());
   const requestId = options.requestId ?? (() => crypto.randomUUID());
-  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), ids, nowUtc);
+  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), undefined, nowUtc);
   const jobs = new JobService(options.database, ids);
 
   routes.use("*", options.authenticate);

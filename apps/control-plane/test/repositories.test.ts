@@ -261,13 +261,18 @@ describe("control-plane repositories", () => {
       idempotencyKey: "idem-key-1",
       operation: "APPROVE_SCRIPT",
     });
-    await repositories.idempotency.create({
+    await repositories.idempotency.reserve({
       actorId: "admin-1",
       createdAtUtc: "2026-08-03T00:00:00Z",
       id: "idem-1",
       idempotencyKey: "idem-key-1",
       operation: "APPROVE_SCRIPT",
       requestHash: "request-hash-1",
+    });
+    await repositories.idempotency.complete({
+      actorId: "admin-1",
+      idempotencyKey: "idem-key-1",
+      operation: "APPROVE_SCRIPT",
       responseJson: "{\"status\":\"accepted\"}",
       responseStatus: 202,
     });
@@ -323,18 +328,14 @@ describe("control-plane repositories", () => {
         values: ["admin-1", "APPROVE_SCRIPT", "idem-key-1"],
       },
       {
+        method: "first",
+        sql: "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, 0, 'null', ?) ON CONFLICT (actor_id, operation, idempotency_key) DO NOTHING RETURNING id",
+        values: ["idem-1", "admin-1", "APPROVE_SCRIPT", "idem-key-1", "request-hash-1", "2026-08-03T00:00:00Z"],
+      },
+      {
         method: "run",
-        sql: "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        values: [
-          "idem-1",
-          "admin-1",
-          "APPROVE_SCRIPT",
-          "idem-key-1",
-          "request-hash-1",
-          202,
-          "{\"status\":\"accepted\"}",
-          "2026-08-03T00:00:00Z",
-        ],
+        sql: "UPDATE idempotency_records SET response_status = ?, response_json = ? WHERE actor_id = ? AND operation = ? AND idempotency_key = ? AND response_status = 0",
+        values: [202, "{\"status\":\"accepted\"}", "admin-1", "APPROVE_SCRIPT", "idem-key-1"],
       },
       {
         method: "run",

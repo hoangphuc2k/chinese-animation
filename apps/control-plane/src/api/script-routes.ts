@@ -45,7 +45,7 @@ export function createScriptRoutes(options: BrowserWorkflowRoutesOptions): Hono<
   const ids = options.newId ?? (() => crypto.randomUUID());
   const nowUtc = options.nowUtc ?? (() => new Date().toISOString());
   const requestId = options.requestId ?? (() => crypto.randomUUID());
-  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), ids, nowUtc);
+  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), undefined, nowUtc);
   const approvals = new ApprovalService(options.database, ids);
 
   routes.post("/jobs/:jobId/scripts", authorize(Action.EditScript), async (context) => {
