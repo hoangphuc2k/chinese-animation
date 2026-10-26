@@ -102,6 +102,17 @@ def test_metadata_allows_multiline_printable_unicode_but_rejects_control_charact
         PublicationMetadata((FacebookMetadata(caption="unsafe\x1ftext", hashtags=()),))
 
 
+@pytest.mark.parametrize("hashtag", ["#hoạthình", "#hoa\u0323thi\u0300nh", "#tu_tiên", "#动画"])
+def test_facebook_hashtags_accept_unicode_letters_and_underscores(hashtag: str) -> None:
+    assert PublicationMetadata((FacebookMetadata(caption="Caption", hashtags=(hashtag,)),))
+
+
+@pytest.mark.parametrize("hashtag", ["#a b", "#!", "#", "hoạthình", "#hoạt-hình", "#tag\u200b"])
+def test_facebook_hashtags_reject_spaces_punctuation_and_empty_bodies(hashtag: str) -> None:
+    with pytest.raises(MetadataValidationError):
+        PublicationMetadata((FacebookMetadata(caption="Caption", hashtags=(hashtag,)),))
+
+
 def test_metadata_requires_unique_destination_identity() -> None:
     with pytest.raises(MetadataValidationError):
         PublicationMetadata(

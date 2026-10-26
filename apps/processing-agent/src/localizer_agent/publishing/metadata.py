@@ -52,8 +52,10 @@ def validate_destination_metadata(metadata: DestinationMetadata) -> None:
         if len(metadata.hashtags) > 100:
             raise MetadataValidationError("Facebook metadata exceeds 100 hashtags.")
         for hashtag in metadata.hashtags:
-            if not hashtag.startswith("#") or len(hashtag) == 1 or not hashtag[1:].replace("_", "").isalnum() or not hashtag.isascii():
-                raise MetadataValidationError("Facebook hashtags must use ASCII letters, numbers, or underscores after #.")
+            normalized = unicodedata.normalize("NFC", hashtag) if isinstance(hashtag, str) else ""
+            body = normalized[1:].replace("_", "")
+            if not normalized.startswith("#") or not body or not body.isalnum():
+                raise MetadataValidationError("Facebook hashtags must use Unicode letters, numbers, or underscores after #.")
         return
 
     raise MetadataValidationError("Publication metadata has an unsupported destination.")
