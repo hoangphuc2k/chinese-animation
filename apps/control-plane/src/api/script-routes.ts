@@ -8,6 +8,7 @@ import { Action, authorize } from "../middleware/authorize";
 import { createRepositories } from "../repositories";
 import { IdempotencyConflictError, IdempotencyService, createIdempotencyStore } from "../services/idempotency-service";
 import { ApprovalMismatchError, ApprovalService } from "../services/approval-service";
+import { StaleWorkflowError } from "../services/job-service";
 import type { BrowserWorkflowRoutesOptions } from "./project-routes";
 
 const ScriptEditRequest = z
@@ -113,7 +114,7 @@ export function createScriptRoutes(options: BrowserWorkflowRoutesOptions): Hono<
       );
       return context.json(result.body, result.status as 202);
     } catch (error) {
-      if (error instanceof IdempotencyConflictError || error instanceof ApprovalMismatchError) {
+      if (error instanceof IdempotencyConflictError || error instanceof ApprovalMismatchError || error instanceof StaleWorkflowError) {
         return problem("CONFLICT", error.message, requestId(), 409);
       }
       throw error;

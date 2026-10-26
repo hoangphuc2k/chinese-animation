@@ -2,6 +2,7 @@ import type { DestinationState, ProcessingState } from "../../../../packages/con
 
 import { assertDestinationTransition } from "../domain/destination-state-machine";
 import { assertJobTransition } from "../domain/job-state-machine";
+import type { SqlDatabase } from "../repositories/sql";
 
 export interface WorkflowStatement {
   bind(...values: unknown[]): WorkflowStatement;
@@ -47,6 +48,7 @@ export interface TransitionDestinationInput {
 export interface CreateImportJobInput {
   actorId: string;
   actorType: string;
+  allowedProcessors: readonly string[];
   jobId: string;
   nowUtc: string;
   projectId: string;
@@ -76,6 +78,29 @@ export class StaleWorkflowError extends Error {
   }
 }
 
+export interface CreatedImport {
+  jobId: string;
+  sourceAssetId: string;
+}
+
+export class ActiveImportExistsError extends Error {
+  constructor(readonly activeJobId: string | null) {
+    super("The source already has an import in progress.");
+  }
+}
+
+export class SourceRightsRevokedError extends Error {
+  constructor() {
+    super("The source's rights were revoked; it cannot be imported again.");
+  }
+}
+
+const terminalJobStates = ["COMPLETED", "FAILED", "CANCELLED", "EXPIRED", "RIGHTS_BLOCKED"] as const;
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Error && /UNIQUE constraint failed/i.test(error.message);
+}
+
 export class RetryNotAllowedError extends Error {
   constructor() {
     super("Only a failed or cancelled job can be retried.");
@@ -89,30 +114,52 @@ async function sha256(value: string): Promise<string> {
 
 export class JobService {
   constructor(
-    private readonly database: WorkflowDatabase,
+    private readonly database: SqlDatabase & WorkflowDatabase,
     private readonly newId: () => string = () => crypto.randomUUID(),
   ) {}
 
-  async createImport(input: CreateImportJobInput): Promise<void> {
+  async createImport(input: CreateImportJobInput): Promise<CreatedImport> {
     const sourceContentHash = await sha256(input.sourceMetadataJson);
     const rightsEvidenceHash = await sha256(input.rightsEvidence);
-    await this.database.batch([
-      this.database
+    const rightsMetadataJson = JSON.stringify({ allowedProcessors: [...input.allowedProcessors], evidenceHash: rightsEvidenceHash });
+    const existing = await this.database
+      .prepare("SELECT id, rights_revoked_at FROM source_assets WHERE source_provider = ? AND external_id = ?")
+      .bind(input.sourceProvider, input.sourceExternalId)
+      .first<{ id: string; rights_revoked_at: string | null }>();
+    if (existing?.rights_revoked_at) throw new SourceRightsRevokedError();
+    if (existing) {
+      const active = await this.database
         .prepare(
-          "INSERT INTO source_assets (id, project_id, source_provider, external_id, metadata_json, content_hash, byte_count, rights_metadata_json, rights_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `SELECT id FROM jobs WHERE source_asset_id = ? AND job_type = 'IMPORT' AND status NOT IN (${terminalJobStates.map(() => "?").join(", ")}) LIMIT 1`,
         )
-        .bind(
-          input.sourceAssetId,
-          input.projectId,
-          input.sourceProvider,
-          input.sourceExternalId,
-          input.sourceMetadataJson,
-          sourceContentHash,
-          0,
-          JSON.stringify({ evidenceHash: rightsEvidenceHash }),
-          null,
-          input.nowUtc,
-        ),
+        .bind(existing.id, ...terminalJobStates)
+        .first<{ id: string }>();
+      if (active) throw new ActiveImportExistsError(active.id);
+    }
+    const sourceAssetId = existing?.id ?? input.sourceAssetId;
+    // A re-import reuses the asset with a fresh rights snapshot (spec section 10).
+    const assetStatement = existing
+      ? this.database
+          .prepare("UPDATE source_assets SET metadata_json = ?, content_hash = ?, rights_metadata_json = ? WHERE id = ? AND rights_revoked_at IS NULL")
+          .bind(input.sourceMetadataJson, sourceContentHash, rightsMetadataJson, sourceAssetId)
+      : this.database
+          .prepare(
+            "INSERT INTO source_assets (id, project_id, source_provider, external_id, metadata_json, content_hash, byte_count, rights_metadata_json, rights_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .bind(
+            sourceAssetId,
+            input.projectId,
+            input.sourceProvider,
+            input.sourceExternalId,
+            input.sourceMetadataJson,
+            sourceContentHash,
+            0,
+            rightsMetadataJson,
+            null,
+            input.nowUtc,
+          );
+    const statements = [
+      assetStatement,
       this.database
         .prepare(
           "INSERT INTO jobs (id, project_id, source_asset_id, job_type, status, step, priority, available_at, attempt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -120,7 +167,7 @@ export class JobService {
         .bind(
           input.jobId,
           input.projectId,
-          input.sourceAssetId,
+          sourceAssetId,
           "IMPORT",
           "QUEUED",
           "QUEUED",
@@ -154,7 +201,14 @@ export class JobService {
           "{}",
           input.nowUtc,
         ),
-    ]);
+    ];
+    try {
+      await this.database.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) throw new ActiveImportExistsError(null);
+      throw error;
+    }
+    return { jobId: input.jobId, sourceAssetId };
   }
 
   async transition(input: TransitionJobInput): Promise<void> {

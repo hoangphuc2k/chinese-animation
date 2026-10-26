@@ -114,6 +114,7 @@ for (const path of [
   "/api/v1/projects",
   "/api/v1/projects/:projectId",
   "/api/v1/projects/:projectId/imports",
+  "/api/v1/jobs/:jobId",
   "/api/v1/jobs/:jobId/cancel",
   "/api/v1/jobs/:jobId/retry",
   "/api/v1/jobs/:jobId/events",

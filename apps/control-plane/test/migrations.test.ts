@@ -327,4 +327,31 @@ describe("D1 migrations", () => {
       `),
     ).toThrow(/UNIQUE constraint failed/i);
   });
+  it("allows one in-flight import per asset, re-import after a terminal job, and one cleanup per target job", () => {
+    const database = createEmptyD1();
+    applyMigrations(database);
+    database.exec(`
+      INSERT INTO projects (id, name, status, created_at, updated_at) VALUES ('project-1', 'Series', 'ACTIVE', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z');
+      INSERT INTO source_assets (id, project_id, source_provider, external_id, metadata_json, content_hash, byte_count, rights_metadata_json, created_at)
+        VALUES ('asset-1', 'project-1', 'CREATOR_HTTPS_URL', 'https://creator.example/a.mp4', '{}', 'hash', 0, '{}', '2026-08-03T00:00:00Z');
+      INSERT INTO jobs (id, project_id, source_asset_id, job_type, status, step, available_at, created_at, updated_at)
+        VALUES ('job-1', 'project-1', 'asset-1', 'IMPORT', 'QUEUED', 'QUEUED', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z');
+    `);
+    const insertImport = (id: string) =>
+      database.exec(
+        `INSERT INTO jobs (id, project_id, source_asset_id, job_type, status, step, available_at, created_at, updated_at) VALUES ('${id}', 'project-1', 'asset-1', 'IMPORT', 'QUEUED', 'QUEUED', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z')`,
+      );
+    const insertCleanup = (id: string, target: string) =>
+      database.exec(
+        `INSERT INTO jobs (id, project_id, source_asset_id, job_type, status, step, available_at, created_at, updated_at, target_job_id) VALUES ('${id}', 'project-1', 'asset-1', 'DELETE_EXPIRED', 'QUEUED', 'DELETE_EXPIRED', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z', '2026-08-03T00:00:00Z', '${target}')`,
+      );
+
+    expect(() => insertImport("job-2")).toThrow(/UNIQUE constraint failed/i);
+    database.exec("UPDATE jobs SET status = 'EXPIRED' WHERE id = 'job-1'");
+    expect(() => insertImport("job-2")).not.toThrow();
+
+    insertCleanup("cleanup-1", "job-1");
+    expect(() => insertCleanup("cleanup-2", "job-1")).toThrow(/UNIQUE constraint failed/i);
+    expect(() => insertCleanup("cleanup-3", "job-2")).not.toThrow();
+  });
 });

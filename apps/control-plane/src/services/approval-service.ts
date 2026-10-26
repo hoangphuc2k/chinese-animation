@@ -1,5 +1,5 @@
 import type { SqlDatabase } from "../repositories/sql";
-import type { WorkflowDatabase } from "./job-service";
+import { StaleWorkflowError, type WorkflowDatabase } from "./job-service";
 
 type ApprovalDatabase = SqlDatabase & WorkflowDatabase;
 
@@ -48,9 +48,12 @@ export interface ApprovePublishInput {
   scheduleAtUtc: string | null;
 }
 
-interface VersionRow extends Record<string, unknown> {
-  content_hash: string;
-  version: number;
+interface ScriptApprovalTargetRow extends Record<string, unknown> {
+  content_hash: string | null;
+  job_version: number;
+  lease_until: string | null;
+  status: string;
+  version: number | null;
 }
 
 interface NextVersionRow extends Record<string, unknown> {
@@ -126,26 +129,53 @@ export class ApprovalService {
   }
 
   async approveScript(input: ApproveScriptInput): Promise<string> {
-    const script = await this.database
-      .prepare("SELECT version, content_hash FROM script_versions WHERE job_id = ? AND version = ?")
-      .bind(input.jobId, input.scriptVersion)
-      .first<VersionRow>();
-    if (!script || script.content_hash !== input.contentHash) throw new ApprovalMismatchError();
+    const target = await this.database
+      .prepare(
+        "SELECT jobs.status, jobs.version AS job_version, jobs.lease_until, latest.version, latest.content_hash FROM jobs LEFT JOIN script_versions AS latest ON latest.job_id = jobs.id AND latest.version = (SELECT MAX(version) FROM script_versions WHERE job_id = jobs.id) WHERE jobs.id = ?",
+      )
+      .bind(input.jobId)
+      .first<ScriptApprovalTargetRow>();
+    // Only the latest version, shown while the job waits for review, can be approved.
+    if (
+      !target ||
+      target.status !== "WAITING_SCRIPT_REVIEW" ||
+      (target.lease_until !== null && target.lease_until > input.nowUtc) ||
+      target.version !== input.scriptVersion ||
+      target.content_hash !== input.contentHash
+    ) {
+      throw new ApprovalMismatchError();
+    }
     const approvalId = this.newId();
-    await this.database.batch([
+    const advancedJob = "EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'GENERATING_VOICE' AND version = ?)";
+    const results = await this.database.batch([
       this.database
         .prepare(
-          "UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL",
+          "UPDATE jobs SET status = 'GENERATING_VOICE', step = 'GENERATING_VOICE', available_at = ?, attempt_count = 0, version = version + 1, updated_at = ? WHERE id = ? AND status = 'WAITING_SCRIPT_REVIEW' AND version = ?",
         )
-        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "SCRIPT_APPROVED"),
+        .bind(input.nowUtc, input.nowUtc, input.jobId, target.job_version),
       this.database
         .prepare(
-          "INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL)",
+          `UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL AND ${advancedJob}`,
         )
-        .bind(approvalId, input.jobId, "SCRIPT_APPROVED", input.scriptVersion, input.contentHash, input.actorId, input.nowUtc),
+        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "SCRIPT_APPROVED", input.jobId, target.job_version + 1),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) SELECT ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL WHERE ${advancedJob}`,
+        )
+        .bind(
+          approvalId,
+          input.jobId,
+          "SCRIPT_APPROVED",
+          input.scriptVersion,
+          input.contentHash,
+          input.actorId,
+          input.nowUtc,
+          input.jobId,
+          target.job_version + 1,
+        ),
+      this.database
+        .prepare(
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${advancedJob}`,
         )
         .bind(
           this.newId(),
@@ -157,12 +187,15 @@ export class ApprovalService {
           input.scriptVersion,
           input.contentHash,
           input.requestId,
-          null,
-          null,
+          "WAITING_SCRIPT_REVIEW",
+          "GENERATING_VOICE",
           "{}",
           input.nowUtc,
+          input.jobId,
+          target.job_version + 1,
         ),
     ]);
+    if (results[0]?.meta?.changes !== 1) throw new StaleWorkflowError();
     return approvalId;
   }
 

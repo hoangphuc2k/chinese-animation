@@ -2,6 +2,7 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 
 import { CreateImportRequest } from "../../../../packages/contracts/src/ingest";
+import { JobDetailResponse } from "../../../../packages/contracts/src/jobs";
 import { ProcessingState } from "../../../../packages/contracts/src/states";
 import type { AuthContext } from "../middleware/access-auth";
 import { Action, authorize } from "../middleware/authorize";
@@ -11,7 +12,14 @@ import type { JobEventRow } from "../repositories/job-events";
 import type { ProjectRow } from "../repositories/projects";
 import type { SqlDatabase } from "../repositories/sql";
 import { IdempotencyConflictError, IdempotencyService, createIdempotencyStore } from "../services/idempotency-service";
-import { JobService, RetryNotAllowedError, StaleWorkflowError, type WorkflowDatabase } from "../services/job-service";
+import {
+  ActiveImportExistsError,
+  JobService,
+  RetryNotAllowedError,
+  SourceRightsRevokedError,
+  StaleWorkflowError,
+  type WorkflowDatabase,
+} from "../services/job-service";
 import { createScriptRoutes } from "./script-routes";
 import { createRenderRoutes } from "./render-routes";
 import { createPublicationRoutes } from "./publication-routes";
@@ -224,27 +232,30 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
           route: context.req.path,
         },
         async () => {
-          const sourceVideoId = ids();
+          const sourceAssetId = ids();
           const jobId = ids();
-          await jobs.createImport({
+          const created = await jobs.createImport({
             actorId: identity.actorId,
             actorType: identity.role,
+            allowedProcessors: body.data.allowedProcessors,
             jobId,
             nowUtc: nowUtc(),
             projectId,
             requestId: requestId(),
             rightsEvidence: body.data.rightsEvidence,
-            sourceAssetId: sourceVideoId,
+            sourceAssetId,
             sourceExternalId: externalIdForImport(body.data.locator),
             sourceMetadataJson: JSON.stringify({ locator: body.data.locator }),
             sourceProvider: body.data.locator.kind,
           });
-          return { body: { jobId, sourceVideoId, state: "QUEUED" }, status: 202 };
+          return { body: { jobId: created.jobId, sourceVideoId: created.sourceAssetId, state: "QUEUED" }, status: 202 };
         },
       );
       return context.json(result.body, result.status as 202);
     } catch (error) {
       if (error instanceof IdempotencyConflictError) return problem("CONFLICT", error.message, requestId(), 409);
+      if (error instanceof ActiveImportExistsError) return problem("CONFLICT", error.message, requestId(), 409);
+      if (error instanceof SourceRightsRevokedError) return problem("RIGHTS_BLOCKED", error.message, requestId(), 409);
       throw error;
     }
   });
@@ -330,6 +341,26 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
       }
       throw error;
     }
+  });
+
+  routes.get("/jobs/:jobId", async (context) => {
+    const job = await repositories.jobs.getDetail(context.req.param("jobId"));
+    if (!job) return problem("NOT_FOUND", "Job was not found.", requestId(), 404);
+    return context.json(
+      JobDetailResponse.parse({
+        jobId: job.id,
+        jobType: job.job_type,
+        lastEventType: job.last_event_type,
+        latestScript:
+          job.latest_script_version !== null && job.latest_script_hash !== null
+            ? { contentHash: job.latest_script_hash, version: job.latest_script_version }
+            : null,
+        retentionDeadlineUtc: job.retention_deadline ? new Date(job.retention_deadline).toISOString() : null,
+        state: job.status,
+        step: job.step,
+        version: job.version,
+      }),
+    );
   });
 
   routes.get("/jobs/:jobId/events", async (context) => {

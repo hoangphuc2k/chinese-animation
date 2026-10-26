@@ -1,81 +1,20 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import { app } from "../src/index";
 import type { AuthContext } from "../src/middleware/access-auth";
 import { createCsrfTokenService } from "../src/middleware/csrf";
+import { createMigratedD1, type SqliteD1 } from "./sqlite-d1";
 import { createTestEnv } from "./worker-harness";
 
-const controlPlaneDirectory = fileURLToPath(new URL("../", import.meta.url));
 const projectId = "00000000-0000-4000-8000-000000000001";
 const projectIdTwo = "00000000-0000-4000-8000-000000000002";
-const databases: DatabaseSync[] = [];
-
-function sqliteInputValues(values: unknown[]): Array<bigint | null | number | string> {
-  return values.map((value) => {
-    if (value === null || typeof value === "bigint" || typeof value === "number" || typeof value === "string") return value;
-    throw new TypeError("The SQLite test adapter only accepts scalar D1 bind values.");
-  });
-}
-
-class SqliteStatement {
-  private values: unknown[] = [];
-
-  constructor(
-    private readonly database: DatabaseSync,
-    private readonly sql: string,
-  ) {}
-
-  bind(...values: unknown[]): this {
-    this.values = values;
-    return this;
-  }
-
-  async all<Row extends Record<string, unknown>>(): Promise<{ results: Row[] }> {
-    return { results: this.database.prepare(this.sql).all(...sqliteInputValues(this.values)) as Row[] };
-  }
-
-  async first<Row extends Record<string, unknown>>(): Promise<Row | null> {
-    return (this.database.prepare(this.sql).get(...sqliteInputValues(this.values)) as Row | undefined) ?? null;
-  }
-
-  async run<Row extends Record<string, unknown>>(): Promise<{ meta: { changes: number }; results: Row[] }> {
-    const result = this.database.prepare(this.sql).run(...sqliteInputValues(this.values));
-    return { meta: { changes: Number(result.changes) }, results: [] };
-  }
-}
-
-class SqliteD1 {
-  constructor(readonly sqlite: DatabaseSync) {}
-
-  prepare(sql: string): SqliteStatement {
-    return new SqliteStatement(this.sqlite, sql);
-  }
-
-  async batch(statements: SqliteStatement[]): Promise<Array<{ meta: { changes: number }; results: Record<string, unknown>[] }>> {
-    this.sqlite.exec("BEGIN");
-    try {
-      const results = await Promise.all(statements.map((statement) => statement.run()));
-      this.sqlite.exec("COMMIT");
-      return results;
-    } catch (error) {
-      this.sqlite.exec("ROLLBACK");
-      throw error;
-    }
-  }
-}
+const databases: SqliteD1[] = [];
 
 function createDatabase(): SqliteD1 {
-  const database = new DatabaseSync(":memory:");
+  const database = createMigratedD1();
   databases.push(database);
-  for (const migration of ["0001_initial.sql", "0002_workflow_versions_and_request_hashes.sql"]) {
-    database.exec(readFileSync(resolve(controlPlaneDirectory, "db/migrations", migration), "utf8"));
-  }
-  return new SqliteD1(database);
+  return database;
 }
 
 function authenticatedBrowser(role: "admin" | "operator" | "reviewer" = "operator") {
@@ -304,6 +243,14 @@ describe("browser workflow API", () => {
     expect(firstEdit.status).toBe(201);
     await expect(firstEdit.json()).resolves.toMatchObject({ contentHash: firstHash, jobId, version: 1 });
 
+    const premature = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: firstHash, jobId, scriptVersion: 1 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-script-early" },
+      method: "POST",
+    });
+    expect(premature.status).toBe(409);
+
+    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW' WHERE id = ?").run(jobId);
     const approved = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
       body: JSON.stringify({ contentHash: firstHash, jobId, scriptVersion: 1 }),
       headers: { "content-type": "application/json", "idempotency-key": "approve-script-1" },
@@ -311,6 +258,7 @@ describe("browser workflow API", () => {
     });
     expect(approved.status).toBe(202);
     await expect(approved.json()).resolves.toMatchObject({ contentHash: firstHash, jobId, scriptVersion: 1 });
+    expect(database.sqlite.prepare("SELECT status FROM jobs WHERE id = ?").get(jobId)).toEqual({ status: "GENERATING_VOICE" });
 
     const secondEdit = await operator.request(`https://control.example.test/jobs/${jobId}/scripts`, {
       body: JSON.stringify({ contentHash: secondHash, transcriptHash: "d".repeat(64) }),
