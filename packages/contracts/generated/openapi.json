@@ -66,6 +66,29 @@
           "locator",
           "rightsEvidence"
         ],
+        "properties": {
+          "allowedProcessors": {
+            "type": "array",
+            "maxItems": 2,
+            "uniqueItems": true,
+            "default": [],
+            "items": {
+              "type": "string",
+              "enum": [
+                "GOOGLE_GEMINI",
+                "AZURE_SPEECH"
+              ]
+            }
+          },
+          "locator": {
+            "$ref": "#/components/schemas/IngestLocator"
+          },
+          "rightsEvidence": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
         "additionalProperties": false
       },
       "ApproveScriptRequest": {
@@ -102,6 +125,9 @@
           "requestId"
         ],
         "properties": {
+          "cleanupInput": {
+            "$ref": "#/components/schemas/CleanupInput"
+          },
           "importInput": {
             "$ref": "#/components/schemas/ImportInput"
           },
@@ -176,6 +202,9 @@
           },
           "expectedState": {
             "type": "string"
+          },
+          "failureCode": {
+            "$ref": "#/components/schemas/FailureCode"
           },
           "state": {
             "type": "string"
@@ -615,6 +644,105 @@
           },
           "state": {
             "const": "EXTRACTING_AUDIO"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CleanupInput": {
+        "type": "object",
+        "required": [
+          "targetJobId"
+        ],
+        "properties": {
+          "targetJobId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FailureCode": {
+        "type": "string",
+        "enum": [
+          "RETRYABLE_NETWORK",
+          "RATE_LIMITED",
+          "AUTH_REQUIRED",
+          "RIGHTS_BLOCKED",
+          "QUOTA_EXHAUSTED",
+          "INVALID_AI_RESPONSE",
+          "MEDIA_INVALID",
+          "DISK_PRESSURE",
+          "MANUAL_REVIEW_REQUIRED"
+        ]
+      },
+      "JobDetailResponse": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "jobType",
+          "lastEventType",
+          "latestScript",
+          "retentionDeadlineUtc",
+          "state",
+          "step",
+          "version"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "jobType": {
+            "type": "string"
+          },
+          "lastEventType": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latestScript": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": [
+                  "contentHash",
+                  "version"
+                ],
+                "properties": {
+                  "contentHash": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "version": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retentionDeadlineUtc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProcessingState"
+          },
+          "step": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
           }
         },
         "additionalProperties": false

@@ -115,8 +115,17 @@ class PreviewPipelineInput(BaseModel):
 PipelineClaimInput = Annotated[Union[ExtractionPipelineInput, TranscriptionPipelineInput, TranslationPipelineInput, VoicePipelineInput, MixingPipelineInput, RenderingPipelineInput, PreviewPipelineInput], Field(discriminator="state")]
 
 
+class CleanupInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    targetJobId: str
+
+
+FailureCode = Literal["RETRYABLE_NETWORK", "RATE_LIMITED", "AUTH_REQUIRED", "RIGHTS_BLOCKED", "QUOTA_EXHAUSTED", "INVALID_AI_RESPONSE", "MEDIA_INVALID", "DISK_PRESSURE", "MANUAL_REVIEW_REQUIRED"]
+
+
 class ClaimJobResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    cleanupInput: CleanupInput | None = None
     importInput: ImportInput | None = None
     ingestResult: IngestResult | None = None
     pipelineInput: PipelineClaimInput | None = None
@@ -147,6 +156,7 @@ class CompleteStepRequest(BaseModel):
     leaseToken: str = Field(min_length=32)
     jobVersion: int = Field(gt=0)
     expectedState: str
+    failureCode: FailureCode | None = None
     state: str
     step: str = Field(min_length=1, max_length=80)
     outputHash: str | None = None

@@ -143,8 +143,23 @@ const outputKindsByTransition = {
   "TRANSCRIBING->TRANSLATING": ["TRANSCRIPT"],
   "TRANSLATING->WAITING_SCRIPT_REVIEW": ["SCRIPT"],
 } as const satisfies Record<string, readonly z.infer<typeof PipelineArtifactKind>[]>;
+export const CleanupInput = z.object({ targetJobId: JobId }).strict();
+export type CleanupInput = z.infer<typeof CleanupInput>;
+export const FailureCode = z.enum([
+  "RETRYABLE_NETWORK",
+  "RATE_LIMITED",
+  "AUTH_REQUIRED",
+  "RIGHTS_BLOCKED",
+  "QUOTA_EXHAUSTED",
+  "INVALID_AI_RESPONSE",
+  "MEDIA_INVALID",
+  "DISK_PRESSURE",
+  "MANUAL_REVIEW_REQUIRED",
+]);
+export type FailureCode = z.infer<typeof FailureCode>;
 export const ClaimJobResponse = z
   .object({
+    cleanupInput: CleanupInput.optional(),
     importInput: ImportInput.optional(),
     ingestResult: IngestResult.optional(),
     jobId: JobId,
@@ -168,6 +183,9 @@ export const ClaimJobResponse = z
         code: "custom",
         message: "only queued or ingesting import claims may include import input",
       });
+    }
+    if ((value.jobType === "DELETE_EXPIRED") !== (value.cleanupInput !== undefined)) {
+      context.addIssue({ code: "custom", message: "only cleanup claims carry cleanup input" });
     }
     const needsIngestResult = value.jobType === "IMPORT" && value.state === "PROBING";
     if (needsIngestResult !== (value.ingestResult !== undefined)) {
@@ -224,6 +242,7 @@ export const CompleteStepRequest = z
     leaseToken: z.string().min(32),
     jobVersion: z.number().int().positive(),
     expectedState: ProcessingState,
+    failureCode: FailureCode.optional(),
     state: ProcessingState,
     step: z.string().min(1).max(80),
     outputHash: Sha256.optional(),
@@ -255,6 +274,12 @@ export const CompleteStepRequest = z
         });
       }
     }
+    if (value.failureCode && value.state !== "FAILED" && value.state !== "MANUAL_REVIEW_REQUIRED") {
+      context.addIssue({
+        code: "custom",
+        message: "failure codes require a FAILED or MANUAL_REVIEW_REQUIRED completion",
+      });
+    }
     const isPreviewCompletion =
       value.expectedState === "READY_FOR_PREVIEW" && value.state === "WAITING_PUBLISH_APPROVAL";
     if (isPreviewCompletion !== (value.preview !== undefined)) {
@@ -264,6 +289,22 @@ export const CompleteStepRequest = z
       });
     }
   });
+export const JobDetailResponse = z
+  .object({
+    jobId: JobId,
+    jobType: JobType,
+    lastEventType: z.string().min(1).nullable(),
+    latestScript: z
+      .object({ contentHash: Sha256, version: z.number().int().positive() })
+      .strict()
+      .nullable(),
+    retentionDeadlineUtc: IsoUtc.nullable(),
+    state: ProcessingState,
+    step: z.string().min(1),
+    version: z.number().int().positive(),
+  })
+  .strict();
+export type JobDetailResponse = z.infer<typeof JobDetailResponse>;
 export const DashboardInboxResponse = z
   .object({
     items: z.array(
