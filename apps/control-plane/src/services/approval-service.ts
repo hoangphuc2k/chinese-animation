@@ -168,6 +168,11 @@ export class ApprovalService {
         .bind(input.nowUtc, input.nowUtc, input.jobId, target.job_version),
       this.database
         .prepare(
+          `INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, 'SCRIPT_APPROVED', 'WAITING_SCRIPT_REVIEW', 'GENERATING_VOICE', '{}', ? WHERE ${advancedJob}`,
+        )
+        .bind(this.newId(), input.jobId, input.nowUtc, input.jobId, target.job_version + 1),
+      this.database
+        .prepare(
           `UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL AND ${advancedJob}`,
         )
         .bind(input.nowUtc, "SUPERSEDED", input.jobId, "SCRIPT_APPROVED", input.jobId, target.job_version + 1),

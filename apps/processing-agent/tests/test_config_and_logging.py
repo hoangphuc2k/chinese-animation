@@ -22,6 +22,22 @@ def test_config_loads_required_values_without_exposing_the_service_token_secret(
     assert config.workspace_root == tmp_path / "workspace"
     assert "sensitive-token" not in repr(config)
     assert config.access_service_token.client_id == "agent-client.access"
+    assert "sensitive-token" not in repr(config.access_service_token)
+
+
+@pytest.mark.parametrize("missing", ["AGENT_ACCESS_CLIENT_ID", "AGENT_ACCESS_CLIENT_SECRET"])
+def test_config_requires_both_access_service_token_parts(tmp_path: Path, missing: str) -> None:
+    values = {
+        "AGENT_ACCESS_CLIENT_ID": "agent-client.access",
+        "AGENT_ACCESS_CLIENT_SECRET": "sensitive-token",
+        "CONTROL_PLANE_URL": "https://control-plane.example.test",
+        "INBOX_ROOT": str(tmp_path / "inbox"),
+        "WORKSPACE_ROOT": str(tmp_path / "workspace"),
+    }
+    values.pop(missing)
+
+    with pytest.raises(ConfigurationError):
+        AgentConfig.from_env(values)
 
 
 @pytest.mark.parametrize("url", ["http://control-plane.example.test", "https://control-plane.example.test/path", "not-a-url"])

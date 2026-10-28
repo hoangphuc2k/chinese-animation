@@ -16,6 +16,14 @@ from localizer_agent.pipeline.approval_gate import ApprovalSnapshot
 
 
 @dataclass(frozen=True)
+class AccessServiceToken:
+    """Cloudflare Access service-token credentials, sent as CF-Access-Client-Id/Secret headers."""
+
+    client_id: str
+    client_secret: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class HttpResponse:
     status_code: int
     body: bytes
@@ -43,18 +51,10 @@ class UrllibTransport:
         return await asyncio.to_thread(request)
 
 
-@dataclass(frozen=True)
-class AccessServiceToken:
-    """Cloudflare Access service-token credentials, sent as the CF-Access-Client-Id/Secret header pair."""
-
-    client_id: str
-    client_secret: str = field(repr=False)
-
-
 class AgentControlPlaneClient:
-    def __init__(self, base_url: str, access_token: AccessServiceToken, transport: HttpTransport | None = None, request_timeout_seconds: int = 30) -> None:
+    def __init__(self, base_url: str, service_token: AccessServiceToken, transport: HttpTransport | None = None, request_timeout_seconds: int = 30) -> None:
         self._base_url = base_url.rstrip("/")
-        self._access_token = access_token
+        self._service_token = service_token
         self._transport = transport or UrllibTransport()
         self._request_timeout_seconds = request_timeout_seconds
 
@@ -126,8 +126,8 @@ class AgentControlPlaneClient:
             method,
             f"{self._base_url}{path}",
             {
-                "CF-Access-Client-Id": self._access_token.client_id,
-                "CF-Access-Client-Secret": self._access_token.client_secret,
+                "CF-Access-Client-Id": self._service_token.client_id,
+                "CF-Access-Client-Secret": self._service_token.client_secret,
                 "Content-Type": "application/json",
             },
             None if payload is None else json.dumps(payload, separators=(",", ":")).encode(),

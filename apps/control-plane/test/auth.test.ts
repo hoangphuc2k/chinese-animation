@@ -8,9 +8,7 @@ import {
   type VerifiedIdentity,
 } from "../src/middleware/access-auth";
 import { Action, authorize, roleAllows } from "../src/middleware/authorize";
-import { createCsrfProtector, createCsrfTokenService } from "../src/middleware/csrf";
-import { workerCsrf } from "../src/index";
-import { createTestEnv } from "./worker-harness";
+import { createCsrfProtector, createCsrfTokenHandler, createCsrfTokenService } from "../src/middleware/csrf";
 
 const encoder = new TextEncoder();
 
@@ -39,6 +37,7 @@ async function accessFixture() {
           email: "admin@example.test",
           exp: now + 300,
           iss: "https://access.example.test",
+          roles: ["admin"],
           sub: "user-admin-1",
           ...claims,
         }),
@@ -73,7 +72,11 @@ function authApp(authenticate: ReturnType<typeof createAccessAuthenticator>) {
 }
 
 describe("Cloudflare Access authentication", () => {
-  it("accepts the allowlisted administrator without any custom roles claim", async () => {
+  it.each([
+    ["operator", "operator"],
+    ["reviewer", "reviewer"],
+    ["admin", "admin"],
+  ] as const)("accepts a signed %s identity", async (role, expectedRole) => {
     const fixture = await accessFixture();
     const fetchJwks = vi.fn(async () =>
       new Response(JSON.stringify(fixture.jwks), { headers: { "cache-control": "max-age=60" } }),
@@ -89,7 +92,7 @@ describe("Cloudflare Access authentication", () => {
     );
 
     const response = await app.request("https://control-plane.test/protected", {
-      headers: { "cf-access-jwt-assertion": await fixture.token() },
+      headers: { "cf-access-jwt-assertion": await fixture.token({ roles: [role] }) },
     });
 
     expect(response.status).toBe(200);
@@ -97,8 +100,47 @@ describe("Cloudflare Access authentication", () => {
       actorId: "user-admin-1",
       email: "admin@example.test",
       kind: "browser",
-      role: "admin",
+      role: expectedRole,
     });
+  });
+
+  it("accepts a real Access identity token, which carries no roles claim, as the single administrator", async () => {
+    const fixture = await accessFixture();
+    const app = authApp(
+      createAccessAuthenticator({
+        allowedEmail: "admin@example.test",
+        audience: "control-plane-audience",
+        fetch: async () => new Response(JSON.stringify(fixture.jwks)),
+        issuer: "https://access.example.test",
+        now: () => fixture.now,
+      }),
+    );
+
+    const response = await app.request("https://control-plane.test/protected", {
+      headers: { "cf-access-jwt-assertion": await fixture.token({ roles: undefined, type: "app" }) },
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ email: "admin@example.test", kind: "browser", role: "admin" });
+  });
+
+  it("rejects a roles claim that grants no known role", async () => {
+    const fixture = await accessFixture();
+    const app = authApp(
+      createAccessAuthenticator({
+        allowedEmail: "admin@example.test",
+        audience: "control-plane-audience",
+        fetch: async () => new Response(JSON.stringify(fixture.jwks)),
+        issuer: "https://access.example.test",
+        now: () => fixture.now,
+      }),
+    );
+
+    const response = await app.request("https://control-plane.test/protected", {
+      headers: { "cf-access-jwt-assertion": await fixture.token({ roles: ["viewer"] }) },
+    });
+
+    expect(response.status).toBe(401);
   });
 
   it.each([
@@ -202,36 +244,91 @@ describe("processing-agent authentication", () => {
         fetch: async () => new Response(JSON.stringify(fixture.jwks)),
         issuer: "https://access.example.test",
         now: () => fixture.now,
-        serviceClientId: "service-agent-1.access",
+        serviceClientId: "agent-client-1.access",
       }),
     );
     app.post("/step", (context) => context.json(context.get("auth")));
     return { app, fixture };
   }
 
-  async function postStep(claims: Record<string, unknown>): Promise<Response> {
-    const { app, fixture } = await agentApp();
-    return app.request("https://control-plane.test/step", {
-      method: "POST",
-      headers: {
-        "cf-access-jwt-assertion": await fixture.token({ aud: ["processing-agent-audience"], email: undefined, ...claims }),
-      },
-    });
+  // Access service-token JWTs carry an empty `sub` and the Client ID in `common_name`.
+  function serviceTokenClaims(commonName: string): Record<string, unknown> {
+    return {
+      aud: ["processing-agent-audience"],
+      common_name: commonName,
+      email: undefined,
+      roles: undefined,
+      sub: "",
+      type: "app",
+    };
   }
 
-  it("accepts a service-token JWT identified by common_name with an empty sub", async () => {
-    const accepted = await postStep({ common_name: "service-agent-1.access", sub: "" });
+  it("accepts a real Access service token for the configured Client ID on the agent audience", async () => {
+    const { app, fixture } = await agentApp();
+
+    const accepted = await app.request("https://control-plane.test/step", {
+      method: "POST",
+      headers: { "cf-access-jwt-assertion": await fixture.token(serviceTokenClaims("agent-client-1.access")) },
+    });
 
     expect(accepted.status).toBe(200);
-    await expect(accepted.json()).resolves.toMatchObject({ actorId: "service-agent-1.access", kind: "agent", role: "agent" });
+    await expect(accepted.json()).resolves.toMatchObject({ actorId: "agent-client-1.access", kind: "agent", role: "agent" });
   });
 
   it.each([
-    ["a different service token", { common_name: "different-service.access", sub: "" }],
-    ["a user JWT presented on the agent audience", { sub: "user-admin-1" }],
-    ["a matching common_name carried by a user JWT", { common_name: "service-agent-1.access", sub: "user-admin-1" }],
-  ] as const)("rejects %s", async (_name, claims) => {
-    expect((await postStep(claims)).status).toBe(401);
+    ["a different service token", serviceTokenClaims("other-client.access")],
+    ["a user identity token", { aud: ["processing-agent-audience"], sub: "user-admin-1" }],
+    [
+      "a user identity token carrying the configured common_name",
+      { ...serviceTokenClaims("agent-client-1.access"), sub: "user-admin-1" },
+    ],
+  ])("rejects %s", async (_name, claims) => {
+    const { app, fixture } = await agentApp();
+
+    const rejected = await app.request("https://control-plane.test/step", {
+      method: "POST",
+      headers: { "cf-access-jwt-assertion": await fixture.token(claims) },
+    });
+
+    expect(rejected.status).toBe(401);
+  });
+});
+
+describe("browser CSRF token issuance", () => {
+  it("issues a token that the protector accepts for the same browser identity", async () => {
+    const tokens = createCsrfTokenService({ now: () => 1_785_600_000, secret: "test-csrf-secret" });
+    const app = new Hono<{ Variables: AuthContext }>();
+    app.use("*", async (context, next) => {
+      context.set("auth", identity());
+      await next();
+    });
+    app.get("/session/csrf-token", createCsrfTokenHandler(tokens));
+    app.post("/mutate", createCsrfProtector({ origin: "https://control-plane.test", tokens }), (context) =>
+      context.json({ status: "mutated" }),
+    );
+
+    const issued = await app.request("https://control-plane.test/session/csrf-token");
+    expect(issued.status).toBe(200);
+    expect(issued.headers.get("cache-control")).toBe("no-store");
+    const { token } = (await issued.json()) as { token: string };
+
+    const mutated = await app.request("https://control-plane.test/mutate", {
+      method: "POST",
+      headers: { origin: "https://control-plane.test", "x-csrf-token": token },
+    });
+    expect(mutated.status).toBe(200);
+  });
+
+  it("does not issue a browser CSRF token to an agent identity", async () => {
+    const tokens = createCsrfTokenService({ secret: "test-csrf-secret" });
+    const app = new Hono<{ Variables: AuthContext }>();
+    app.use("*", async (context, next) => {
+      context.set("auth", { actorId: "agent-1", kind: "agent", role: "agent" });
+      await next();
+    });
+    app.get("/session/csrf-token", createCsrfTokenHandler(tokens));
+
+    expect((await app.request("https://control-plane.test/session/csrf-token")).status).toBe(403);
   });
 });
 
@@ -286,31 +383,5 @@ describe("browser mutation CSRF protection", () => {
     );
 
     expect((await app.request("https://control-plane.test/agent-step", { method: "POST" })).status).toBe(200);
-  });
-});
-
-describe("worker CSRF wiring", () => {
-  it("binds browser mutations to the administrator origin, not the preview origin", async () => {
-    const env = createTestEnv();
-    const csrf = workerCsrf(env);
-    const app = new Hono<{ Variables: AuthContext }>();
-    app.use("*", async (context, next) => {
-      context.set("auth", identity());
-      await next();
-    });
-    app.post("/mutate", csrf.protector, (context) => context.json({ status: "mutated" }));
-    const token = await csrf.tokens.issue("user-admin-1");
-
-    const fromAdmin = await app.request("https://control-plane.test/mutate", {
-      method: "POST",
-      headers: { origin: env.ADMIN_ORIGIN, "x-csrf-token": token },
-    });
-    const fromPreview = await app.request("https://control-plane.test/mutate", {
-      method: "POST",
-      headers: { origin: env.PREVIEW_ORIGIN, "x-csrf-token": token },
-    });
-
-    expect(fromAdmin.status).toBe(200);
-    expect(fromPreview.status).toBe(403);
   });
 });

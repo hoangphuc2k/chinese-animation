@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ImportInput } from "../../../packages/contracts/src/jobs";
 import type { AuthContext } from "../src/middleware/access-auth";
@@ -73,6 +73,29 @@ describe("agent routes", () => {
       requestId: "00000000-0000-4000-8000-000000000099",
       state: "QUEUED",
     });
+  });
+
+  it("generates request IDs without detaching crypto.randomUUID, which the Workers runtime rejects", async () => {
+    const original = crypto.randomUUID;
+    // workerd throws "Illegal invocation" when randomUUID is called without `this === crypto`.
+    vi.spyOn(crypto, "randomUUID").mockImplementation(function (this: unknown) {
+      if (this !== crypto) throw new TypeError("Illegal invocation");
+      return original.call(crypto);
+    });
+    try {
+      const routes = new Hono<{ Variables: AuthContext }>();
+      routes.route("/api/v1/agent", createAgentRoutes({ authenticate: agentAuth(), leaseDurationSeconds: 300, leaseService: service() }));
+
+      const response = await routes.request("https://control-plane.test/api/v1/agent/jobs/claim", {
+        body: JSON.stringify({ supportedJobTypes: ["LOCALIZE"], supportedStates: ["QUEUED"] }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+
+      expect(response.status).toBe(200);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("binds a compatible IMPORT claim to sanitized ingest input", async () => {

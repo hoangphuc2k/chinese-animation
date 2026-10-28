@@ -74,10 +74,15 @@ export class SqliteD1 {
   }
 }
 
-export function createMigratedD1(): SqliteD1 {
+const allMigrations = (): string[] => readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
+
+/** In-memory SQLite database with the given migrations (all of them by default) applied. */
+export function createSqliteD1(migrations: readonly string[] = allMigrations()): SqliteD1 {
   const database = new DatabaseSync(":memory:");
-  for (const file of readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort()) {
-    database.exec(readFileSync(resolve(migrationsDirectory, file), "utf8"));
-  }
+  for (const file of migrations) database.exec(readFileSync(resolve(migrationsDirectory, file), "utf8"));
   return new SqliteD1(database);
+}
+
+export function createMigratedD1(): SqliteD1 {
+  return createSqliteD1();
 }

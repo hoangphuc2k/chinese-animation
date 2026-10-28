@@ -10,6 +10,7 @@ const OciLocator = z.object({
   inboxFileId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/),
 }).strict();
 export const IngestLocator = z.discriminatedUnion("kind", [HttpsLocator, OciLocator]);
+/** Third-party AI processors the rights evidence explicitly allows (spec section 6). */
 export const AiProcessor = z.enum(["GOOGLE_GEMINI", "AZURE_SPEECH"]);
 export const CreateImportRequest = z
   .object({

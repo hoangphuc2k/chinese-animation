@@ -18,6 +18,15 @@ describe("wire contracts", () => {
     expect(CreateImportRequest.parse({ locator: { kind: "OCI_INBOX_FILE", inboxFileId: "inbox-01" }, rightsEvidence: "license-1" })).toBeTruthy();
   });
 
+  it("records named AI processors allowed by the rights evidence and defaults to none", () => {
+    const locator = { kind: "OCI_INBOX_FILE", inboxFileId: "inbox-01" };
+    expect(CreateImportRequest.parse({ locator, rightsEvidence: "license-1" }).allowedProcessors).toEqual([]);
+    expect(
+      CreateImportRequest.parse({ allowedProcessors: ["GOOGLE_GEMINI"], locator, rightsEvidence: "license-1" }).allowedProcessors,
+    ).toEqual(["GOOGLE_GEMINI"]);
+    expect(() => CreateImportRequest.parse({ allowedProcessors: ["OTHER_AI"], locator, rightsEvidence: "license-1" })).toThrow();
+  });
+
   it("requires version-bound script approval hashes", () => {
     expect(ApproveScriptRequest.parse({ jobId, scriptVersion: 4, contentHash: hash })).toBeTruthy();
     expect(() => ApproveScriptRequest.parse({ jobId, scriptVersion: 4, contentHash: "abc" })).toThrow();

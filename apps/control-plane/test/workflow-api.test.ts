@@ -4,7 +4,6 @@ import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import { app } from "../src/index";
 import type { AuthContext } from "../src/middleware/access-auth";
 import { DestinationMetadata, publishMetadataHash } from "../../../packages/contracts/src/publishing";
-import { createCsrfTokenService } from "../src/middleware/csrf";
 import { createMigratedD1, type SqliteD1 } from "./sqlite-d1";
 import { createTestEnv } from "./worker-harness";
 
@@ -60,22 +59,6 @@ describe("browser workflow API", () => {
     const response = await app.fetch(new Request("https://control.example.test/api/v1/projects"), createTestEnv());
 
     expect(response.status).toBe(401);
-  });
-
-  it("issues a CSRF token bound to the verified browser identity", async () => {
-    const tokens = createCsrfTokenService({ secret: "test-csrf-secret" });
-    const routes = createBrowserWorkflowRoutes({
-      authenticate: authenticatedBrowser("admin"),
-      csrf: noCsrf(),
-      csrfTokens: tokens,
-      database: createDatabase(),
-    });
-
-    const response = await routes.request("https://control.example.test/csrf-token");
-
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { csrfToken: string };
-    await expect(tokens.verify(body.csrfToken, "operator-1")).resolves.toBe(true);
   });
 
   it("creates projects and exposes stable, bounded project pagination and detail", async () => {
@@ -285,6 +268,74 @@ describe("browser workflow API", () => {
       ],
       nextCursor: null,
     });
+  });
+
+  it("advances a job waiting for script review to voice generation only for the latest script version", async () => {
+    const database = createDatabase();
+    const operator = createRoutes([projectId], "operator", database);
+    const reviewer = createRoutes([], "reviewer", database);
+    await operator.request("https://control.example.test/projects", {
+      body: JSON.stringify({ name: "Review project" }),
+      headers: { "content-type": "application/json", "idempotency-key": "create-review-project" },
+      method: "POST",
+    });
+    const imported = await operator.request(`https://control.example.test/projects/${projectId}/imports`, {
+      body: JSON.stringify({
+        allowedProcessors: ["GOOGLE_GEMINI"],
+        locator: { kind: "OCI_INBOX_FILE", inboxFileId: "episode-2.mp4" },
+        rightsEvidence: "creator permission record 2026-08-04",
+      }),
+      headers: { "content-type": "application/json", "idempotency-key": "import-review-job" },
+      method: "POST",
+    });
+    const { jobId } = (await imported.json()) as { jobId: string };
+    const rights = database.sqlite
+      .prepare("SELECT rights_metadata_json FROM source_assets WHERE id = (SELECT source_asset_id FROM jobs WHERE id = ?)")
+      .get(jobId) as { rights_metadata_json: string };
+    expect(JSON.parse(rights.rights_metadata_json)).toMatchObject({ allowedProcessors: ["GOOGLE_GEMINI"] });
+    for (const [key, hash] of [
+      ["review-edit-1", "a".repeat(64)],
+      ["review-edit-2", "b".repeat(64)],
+    ] as const) {
+      await operator.request(`https://control.example.test/jobs/${jobId}/scripts`, {
+        body: JSON.stringify({ contentHash: hash, transcriptHash: "c".repeat(64) }),
+        headers: { "content-type": "application/json", "idempotency-key": key },
+        method: "POST",
+      });
+    }
+    // Voice generation synthesizes the agent's SCRIPT artifact, so the approved version must match it.
+    const lineage = JSON.stringify([
+      [{ artifactRef: "script-02.json", byteCount: 10, kind: "SCRIPT", sha256: "b".repeat(64), toolVersion: "gemini-test" }],
+    ]);
+    database.sqlite
+      .prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', step = 'WAITING_SCRIPT_REVIEW', pipeline_lineage_json = ? WHERE id = ?")
+      .run(lineage, jobId);
+    const versionBefore = (database.sqlite.prepare("SELECT version FROM jobs WHERE id = ?").get(jobId) as { version: number }).version;
+
+    const superseded = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: "a".repeat(64), jobId, scriptVersion: 1 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-superseded" },
+      method: "POST",
+    });
+    expect(superseded.status).toBe(409);
+    expect(database.sqlite.prepare("SELECT status FROM jobs WHERE id = ?").get(jobId)).toMatchObject({ status: "WAITING_SCRIPT_REVIEW" });
+
+    const approved = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: "b".repeat(64), jobId, scriptVersion: 2 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-latest" },
+      method: "POST",
+    });
+    expect(approved.status).toBe(202);
+    expect(database.sqlite.prepare("SELECT status, step, version FROM jobs WHERE id = ?").get(jobId)).toMatchObject({
+      status: "GENERATING_VOICE",
+      step: "GENERATING_VOICE",
+      version: versionBefore + 1,
+    });
+    expect(
+      database.sqlite
+        .prepare("SELECT event_type, previous_state, next_state FROM job_events WHERE job_id = ? AND next_state = 'GENERATING_VOICE'")
+        .all(jobId),
+    ).toEqual([{ event_type: "SCRIPT_APPROVED", next_state: "GENERATING_VOICE", previous_state: "WAITING_SCRIPT_REVIEW" }]);
   });
 
   it("binds publish approval to an immutable render and exposes only an opaque preview descriptor", async () => {

@@ -3,8 +3,8 @@ import { Hono, type Context } from "hono";
 import { createAgentRoutes } from "./api/agent-routes";
 import { createBrowserWorkflowRoutes } from "./api/project-routes";
 import type { WorkerEnv } from "./env";
-import { createAccessAuthenticator, createAgentAuthenticator } from "./middleware/access-auth";
-import { createCsrfProtector, createCsrfTokenService, type CsrfTokenService } from "./middleware/csrf";
+import { createAccessAuthenticator, createAgentAuthenticator, type AuthContext } from "./middleware/access-auth";
+import { createCsrfProtector, createCsrfTokenHandler, createCsrfTokenService, type CsrfTokenService } from "./middleware/csrf";
 import { createStructuredLogger } from "./observability/logger";
 import { RetentionService } from "./scheduled/retention";
 import { LeaseService, type LeaseDatabase } from "./services/lease-service";
@@ -29,7 +29,8 @@ function problemResponse(problem: ProblemDetails): Response {
 export const app = new Hono<{ Bindings: WorkerEnv }>();
 const agentAuthenticators = new Map<string, ReturnType<typeof createAgentAuthenticator>>();
 const browserAuthenticators = new Map<string, ReturnType<typeof createAccessAuthenticator>>();
-const csrfProtectors = new Map<string, WorkerCsrf>();
+const csrfProtectors = new Map<string, ReturnType<typeof createCsrfProtector>>();
+const csrfTokenServices = new Map<string, CsrfTokenService>();
 
 function agentAuthenticator(env: WorkerEnv): ReturnType<typeof createAgentAuthenticator> {
   const key = `${env.ACCESS_ISSUER}:${env.AGENT_ACCESS_AUDIENCE}:${env.AGENT_SERVICE_CLIENT_ID}`;
@@ -59,20 +60,23 @@ function browserAuthenticator(env: WorkerEnv): ReturnType<typeof createAccessAut
   return authenticator;
 }
 
-interface WorkerCsrf {
-  protector: ReturnType<typeof createCsrfProtector>;
-  tokens: CsrfTokenService;
+function csrfTokenService(env: WorkerEnv): CsrfTokenService {
+  let tokens = csrfTokenServices.get(env.CSRF_SIGNING_SECRET);
+  if (!tokens) {
+    tokens = createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET });
+    csrfTokenServices.set(env.CSRF_SIGNING_SECRET, tokens);
+  }
+  return tokens;
 }
 
-export function workerCsrf(env: WorkerEnv): WorkerCsrf {
+function csrfProtector(env: WorkerEnv): ReturnType<typeof createCsrfProtector> {
   const key = `${env.ADMIN_ORIGIN}:${env.CSRF_SIGNING_SECRET}`;
-  let csrf = csrfProtectors.get(key);
-  if (!csrf) {
-    const tokens = createCsrfTokenService({ secret: env.CSRF_SIGNING_SECRET });
-    csrf = { protector: createCsrfProtector({ origin: env.ADMIN_ORIGIN, tokens }), tokens };
-    csrfProtectors.set(key, csrf);
+  let protector = csrfProtectors.get(key);
+  if (!protector) {
+    protector = createCsrfProtector({ origin: env.ADMIN_ORIGIN, tokens: csrfTokenService(env) });
+    csrfProtectors.set(key, protector);
   }
-  return csrf;
+  return protector;
 }
 
 app.get("/api/v1/health", (context) => {
@@ -83,6 +87,12 @@ app.get("/api/v1/health", (context) => {
     requestId,
     status: "ok",
   });
+});
+
+app.get("/api/v1/session/csrf-token", (context) => {
+  const routes = new Hono<{ Variables: AuthContext }>();
+  routes.get("*", browserAuthenticator(context.env), createCsrfTokenHandler(csrfTokenService(context.env)));
+  return routes.fetch(context.req.raw);
 });
 
 app.all("/api/v1/agent/*", async (context) => {
@@ -97,11 +107,9 @@ app.all("/api/v1/agent/*", async (context) => {
 });
 
 async function browserWorkflowResponse(context: Context<{ Bindings: WorkerEnv }>): Promise<Response> {
-  const csrf = workerCsrf(context.env);
   const routes = createBrowserWorkflowRoutes({
     authenticate: browserAuthenticator(context.env),
-    csrf: csrf.protector,
-    csrfTokens: csrf.tokens,
+    csrf: csrfProtector(context.env),
     database: context.env.CONTROL_PLANE_DB,
   });
   const url = new URL(context.req.url);
@@ -110,7 +118,6 @@ async function browserWorkflowResponse(context: Context<{ Bindings: WorkerEnv }>
 }
 
 for (const path of [
-  "/api/v1/csrf-token",
   "/api/v1/projects",
   "/api/v1/projects/:projectId",
   "/api/v1/projects/:projectId/imports",

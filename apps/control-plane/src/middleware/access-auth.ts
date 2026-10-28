@@ -27,6 +27,7 @@ interface AccessJwtClaims {
   email?: unknown;
   exp?: unknown;
   iss?: unknown;
+  roles?: unknown;
   sub?: unknown;
 }
 
@@ -54,6 +55,7 @@ export interface AccessAuthOptions extends CommonAuthOptions {
 }
 
 export interface AgentAuthOptions extends CommonAuthOptions {
+  /** Access service-token Client ID; Access puts it in the JWT `common_name` claim. */
   serviceClientId: string;
 }
 
@@ -121,6 +123,18 @@ function audienceMatches(value: unknown, expected: string): boolean {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value) throw new AuthenticationError(`${name} claim is missing`);
   return value;
+}
+
+function roleFromClaims(value: unknown): AccessRole {
+  // Access identity tokens carry no roles claim; the allowed email is the single administrator.
+  if (value === undefined) return "admin";
+  if (!Array.isArray(value) || !value.every((role) => typeof role === "string")) {
+    throw new AuthenticationError("roles claim is missing");
+  }
+  if (value.includes("admin")) return "admin";
+  if (value.includes("reviewer")) return "reviewer";
+  if (value.includes("operator")) return "operator";
+  throw new AuthenticationError("roles claim has no authorized role");
 }
 
 function defaultJwksUrl(issuer: string): string {
@@ -204,7 +218,7 @@ export function createAccessAuthenticator(options: AccessAuthOptions): Middlewar
         actorId: requiredString(claims.sub, "sub"),
         email,
         kind: "browser",
-        role: "admin",
+        role: roleFromClaims(claims.roles),
       });
       await next();
     } catch {
