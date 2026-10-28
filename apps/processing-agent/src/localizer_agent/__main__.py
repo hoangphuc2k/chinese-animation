@@ -6,12 +6,13 @@ import asyncio
 import hashlib
 from pathlib import Path
 
+from localizer_agent.cleanup import CleanupHandler
 from localizer_agent.config import AgentConfig
 from localizer_agent.control_plane import AgentControlPlaneClient
 from localizer_agent.localization.gemini_client import GeminiClient
 from localizer_agent.media import MediaProcessor
 from localizer_agent.pipeline.stages import GeminiTranslationOperations, MixingHandler, PreviewHandler, RenderHandler, TranslationHandler, VoiceHandler
-from localizer_agent.pipeline.supervisor import ProcessingSupervisor, StageHandler
+from localizer_agent.pipeline.supervisor import JobTypeRouter, ProcessingSupervisor, StageHandler
 from localizer_agent.pipeline.transcription_stage import AudioExtractionHandler, ProbeHandler, TranscriptionHandler
 from localizer_agent.preview.registry import PreviewRegistry
 from localizer_agent.structured_logging import create_logger
@@ -48,8 +49,13 @@ async def run() -> None:
         config.heartbeat_interval_seconds,
         config.request_timeout_seconds,
     )
-    handlers: dict[str, StageHandler] = {"QUEUED": import_supervisor, "INGESTING": import_supervisor}
-    job_types_by_state = {"QUEUED": ["IMPORT"], "INGESTING": ["IMPORT"]}
+    # One registry instance: preview registration and cleanup revocation share its persisted state.
+    preview_registry = PreviewRegistry(config.workspace_root / "preview-registry.json")
+    queued_router = JobTypeRouter(
+        {"IMPORT": import_supervisor, "DELETE_EXPIRED": CleanupHandler(client, workspace_manager, preview_registry)}
+    )
+    handlers: dict[str, StageHandler] = {"QUEUED": queued_router, "INGESTING": import_supervisor}
+    job_types_by_state = {"QUEUED": list(queued_router.job_types), "INGESTING": ["IMPORT"]}
     if config.whisper_binary_path is not None and config.whisper_model_path is not None and config.whisper_model_sha256 is not None:
         whisper = WhisperCpp(
             config.whisper_binary_path,
@@ -134,7 +140,7 @@ async def run() -> None:
     handlers["READY_FOR_PREVIEW"] = PreviewHandler(
         client,
         workspace_manager,
-        PreviewRegistry(config.workspace_root / "preview-registry.json"),
+        preview_registry,
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
     )
     job_types_by_state["READY_FOR_PREVIEW"] = ["IMPORT", "LOCALIZE", "RENDER"]
