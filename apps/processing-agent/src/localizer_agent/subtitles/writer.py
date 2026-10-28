@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -41,9 +42,14 @@ def _wrap(text: str) -> list[str]:
         lines.append(current)
         current = word
     lines.append(current)
-    if len(lines) > 2:
-        raise SubtitleError("Subtitle cue cannot fit within two readable lines.")
     return lines
+
+
+@dataclass(frozen=True)
+class _Cue:
+    start_ms: int
+    end_ms: int
+    lines: list[str]
 
 
 def _timecode(milliseconds: int, separator: str) -> str:
@@ -53,20 +59,40 @@ def _timecode(milliseconds: int, separator: str) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02}{separator}{remainder:03}"
 
 
-def _validate(segments: Sequence[ScriptSegment]) -> list[list[str]]:
+def _segment_cues(segment: ScriptSegment) -> list[_Cue]:
+    """Split one segment into consecutive cues of at most two lines, timed by their share of the text."""
+    lines = _wrap(segment.text)
+    groups = [lines[index : index + 2] for index in range(0, len(lines), 2)]
+    weights = [sum(len(_graphemes(line)) for line in group) for group in groups]
+    total = sum(weights)
+    duration = segment.end_ms - segment.start_ms
+    cues: list[_Cue] = []
+    start = segment.start_ms
+    consumed = 0
+    for index, (group, weight) in enumerate(zip(groups, weights, strict=True)):
+        consumed += weight
+        end = segment.end_ms if index == len(groups) - 1 else segment.start_ms + round(duration * consumed / total)
+        cues.append(_Cue(start_ms=start, end_ms=end, lines=group))
+        start = end
+    return cues
+
+
+def _validate(segments: Sequence[ScriptSegment]) -> list[_Cue]:
     previous_end = 0
-    wrapped: list[list[str]] = []
+    cues: list[_Cue] = []
     for segment in segments:
-        duration = segment.end_ms - segment.start_ms
-        if segment.start_ms < previous_end or duration < 1_000:
+        if segment.start_ms < previous_end or segment.end_ms - segment.start_ms < 1_000:
             raise SubtitleError("Subtitle cues must be monotonic and visible for at least one second.")
-        lines = _wrap(segment.text)
-        reading_length = sum(len(_graphemes(line)) for line in lines)
-        if reading_length > duration / 1_000 * 20:
-            raise SubtitleError("Subtitle cue exceeds the 20-grapheme-per-second reading limit.")
-        wrapped.append(lines)
+        for cue in _segment_cues(segment):
+            duration = cue.end_ms - cue.start_ms
+            if duration < 1_000:
+                raise SubtitleError("Subtitle cues must be monotonic and visible for at least one second.")
+            reading_length = sum(len(_graphemes(line)) for line in cue.lines)
+            if reading_length > duration / 1_000 * 20:
+                raise SubtitleError("Subtitle cue exceeds the 20-grapheme-per-second reading limit.")
+            cues.append(cue)
         previous_end = segment.end_ms
-    return wrapped
+    return cues
 
 
 def _atomic_write(path: Path, content: str) -> Path:
@@ -85,18 +111,16 @@ def _atomic_write(path: Path, content: str) -> Path:
 
 
 def write_srt(segments: Sequence[ScriptSegment], destination: Path) -> Path:
-    wrapped = _validate(segments)
-    cues = []
-    for index, (segment, lines) in enumerate(zip(segments, wrapped, strict=True), start=1):
-        cue_text = "\n".join(lines)
-        cues.append(f"{index}\n{_timecode(segment.start_ms, ',')} --> {_timecode(segment.end_ms, ',')}\n{cue_text}")
+    cues = [
+        f"{index}\n{_timecode(cue.start_ms, ',')} --> {_timecode(cue.end_ms, ',')}\n" + "\n".join(cue.lines)
+        for index, cue in enumerate(_validate(segments), start=1)
+    ]
     return _atomic_write(destination, "\n\n".join(cues) + ("\n" if cues else ""))
 
 
 def write_webvtt(segments: Sequence[ScriptSegment], destination: Path) -> Path:
-    wrapped = _validate(segments)
-    cues = []
-    for segment, lines in zip(segments, wrapped, strict=True):
-        cue_text = "\n".join(lines)
-        cues.append(f"{_timecode(segment.start_ms, '.')} --> {_timecode(segment.end_ms, '.')}\n{cue_text}")
+    cues = [
+        f"{_timecode(cue.start_ms, '.')} --> {_timecode(cue.end_ms, '.')}\n" + "\n".join(cue.lines)
+        for cue in _validate(segments)
+    ]
     return _atomic_write(destination, "WEBVTT\n\n" + "\n\n".join(cues) + ("\n" if cues else ""))
