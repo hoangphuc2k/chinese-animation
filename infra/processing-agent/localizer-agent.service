@@ -16,7 +16,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/localizer-agent
+ReadWritePaths=/mnt/localizer/workspaces
 
 [Install]
 WantedBy=multi-user.target
