@@ -28,6 +28,9 @@ describe("Facebook hashtags", () => {
 
     expect(facebook(["#hoạthình", "#tu_tiên", "#动画"])).toBe(true);
     expect(facebook(["#hoạt-hình"])).toBe(false);
+    // Same rule as the agent: NFC-normalize, then letters, digits and underscores only.
+    expect(facebook(["#hoạthình".normalize("NFD")])).toBe(true);
+    expect(facebook(["#हिन्दी"])).toBe(false);
     expect(facebook(["#a b"])).toBe(false);
   });
 });

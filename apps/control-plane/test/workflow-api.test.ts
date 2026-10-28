@@ -252,7 +252,13 @@ describe("browser workflow API", () => {
     });
     expect(premature.status).toBe(409);
 
-    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW' WHERE id = ?").run(jobId);
+    // The agent's translated SCRIPT artifact is what voice generation will synthesize; approval must match it.
+    const lineage = JSON.stringify([
+      [{ artifactRef: "script-01.json", byteCount: 10, kind: "SCRIPT", sha256: firstHash, toolVersion: "gemini-test" }],
+    ]);
+    database.sqlite
+      .prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', pipeline_lineage_json = ? WHERE id = ?")
+      .run(lineage, jobId);
     const approved = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
       body: JSON.stringify({ contentHash: firstHash, jobId, scriptVersion: 1 }),
       headers: { "content-type": "application/json", "idempotency-key": "approve-script-1" },

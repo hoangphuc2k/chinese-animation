@@ -89,6 +89,12 @@ export class ActiveImportExistsError extends Error {
   }
 }
 
+export class SourceOwnedByAnotherProjectError extends Error {
+  constructor() {
+    super("The source was already imported into a different project.");
+  }
+}
+
 export class SourceRightsRevokedError extends Error {
   constructor() {
     super("The source's rights were revoked; it cannot be imported again.");
@@ -123,9 +129,10 @@ export class JobService {
     const rightsEvidenceHash = await sha256(input.rightsEvidence);
     const rightsMetadataJson = JSON.stringify({ allowedProcessors: [...input.allowedProcessors], evidenceHash: rightsEvidenceHash });
     const existing = await this.database
-      .prepare("SELECT id, rights_revoked_at FROM source_assets WHERE source_provider = ? AND external_id = ?")
+      .prepare("SELECT id, project_id, rights_revoked_at FROM source_assets WHERE source_provider = ? AND external_id = ?")
       .bind(input.sourceProvider, input.sourceExternalId)
-      .first<{ id: string; rights_revoked_at: string | null }>();
+      .first<{ id: string; project_id: string; rights_revoked_at: string | null }>();
+    if (existing && existing.project_id !== input.projectId) throw new SourceOwnedByAnotherProjectError();
     if (existing?.rights_revoked_at) throw new SourceRightsRevokedError();
     if (existing) {
       const active = await this.database
@@ -283,20 +290,29 @@ export class JobService {
 
   async retry(input: RetryJobInput): Promise<void> {
     if (input.expectedState !== "FAILED" && input.expectedState !== "CANCELLED") throw new RetryNotAllowedError();
+    const retriedJob = "EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'QUEUED' AND version = ?)";
+    const retriedJobValues = [input.jobId, input.expectedVersion + 1];
     const statements = [
       this.database
         .prepare(
-          "UPDATE jobs SET status = ?, step = ?, version = version + 1, attempt_count = attempt_count + 1, available_at = ?, updated_at = ? WHERE id = ? AND status = ? AND version = ?",
+          // A retry starts a new cycle: fresh per-step attempts, no retention deadline, and it waits
+          // while a cleanup of this job is actively running.
+          "UPDATE jobs SET status = ?, step = ?, version = version + 1, attempt_count = 0, retention_deadline = NULL, available_at = ?, updated_at = ? WHERE id = ? AND status = ? AND version = ? AND NOT EXISTS (SELECT 1 FROM jobs cleanup WHERE cleanup.target_job_id = jobs.id AND cleanup.job_type = 'DELETE_EXPIRED' AND cleanup.status = 'QUEUED' AND cleanup.lease_until > ?)",
         )
-        .bind("QUEUED", "QUEUED", input.nowUtc, input.nowUtc, input.jobId, input.expectedState, input.expectedVersion),
+        .bind("QUEUED", "QUEUED", input.nowUtc, input.nowUtc, input.jobId, input.expectedState, input.expectedVersion, input.nowUtc),
       this.database
         .prepare(
-          "INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          `UPDATE jobs SET status = 'CANCELLED', step = 'TARGET_RETRIED', version = version + 1, updated_at = ? WHERE job_type = 'DELETE_EXPIRED' AND target_job_id = ? AND status = 'QUEUED' AND ${retriedJob}`,
         )
-        .bind(input.eventId, input.jobId, input.operation, input.expectedState, "QUEUED", "{}", input.nowUtc),
+        .bind(input.nowUtc, input.jobId, ...retriedJobValues),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${retriedJob}`,
+        )
+        .bind(input.eventId, input.jobId, input.operation, input.expectedState, "QUEUED", "{}", input.nowUtc, ...retriedJobValues),
+      this.database
+        .prepare(
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${retriedJob}`,
         )
         .bind(
           this.newId(),
@@ -312,6 +328,7 @@ export class JobService {
           "QUEUED",
           "{}",
           input.nowUtc,
+          ...retriedJobValues,
         ),
     ];
     const results = await this.database.batch(statements);

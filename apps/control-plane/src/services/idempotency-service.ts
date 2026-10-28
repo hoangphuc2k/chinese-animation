@@ -12,10 +12,17 @@ export interface IdempotencyKeyInput {
 
 /** A reserved key whose mutation has not finished yet stores this response status. */
 export const PENDING_RESPONSE_STATUS = 0;
+/** A pending reservation older than this is treated as abandoned (the request died) and may be reclaimed. */
+export const PENDING_RESERVATION_TTL_MS = 5 * 60 * 1000;
 
 export interface IdempotencyStore {
-  /** Atomically claims the key; returns false when any record (pending or finished) already holds it. */
-  reserve(input: IdempotencyKeyInput & { createdAtUtc: string; id: string; requestHash: string }): Promise<boolean>;
+  /**
+   * Atomically claims the key. Returns false when a finished record holds it, or a pending one created at
+   * or after `staleBeforeUtc`; an older pending record is reclaimed.
+   */
+  reserve(
+    input: IdempotencyKeyInput & { createdAtUtc: string; id: string; requestHash: string; staleBeforeUtc: string },
+  ): Promise<boolean>;
   complete(input: IdempotencyKeyInput & { responseBody: unknown; responseStatus: number }): Promise<void>;
   release(input: IdempotencyKeyInput): Promise<void>;
   find(input: IdempotencyKeyInput): Promise<StoredIdempotencyResult | null>;
@@ -110,7 +117,9 @@ export class IdempotencyService {
     if (!input.idempotencyKey) throw new TypeError("Idempotency-Key is required.");
     const requestHash = await sha256(canonicalJson({ actorId: input.actorId, body: input.body, route: input.route }));
     const key = { actorId: input.actorId, idempotencyKey: input.idempotencyKey, operation: input.operation };
-    const reserved = await this.store.reserve({ ...key, createdAtUtc: this.nowUtc(), id: this.newId(), requestHash });
+    const createdAtUtc = this.nowUtc();
+    const staleBeforeUtc = new Date(new Date(createdAtUtc).getTime() - PENDING_RESERVATION_TTL_MS).toISOString();
+    const reserved = await this.store.reserve({ ...key, createdAtUtc, id: this.newId(), requestHash, staleBeforeUtc });
     if (!reserved) {
       const existing = await this.store.find(key);
       if (existing && existing.requestHash !== requestHash) throw new IdempotencyConflictError();

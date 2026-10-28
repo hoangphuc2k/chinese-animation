@@ -327,7 +327,7 @@ describe("D1 migrations", () => {
       `),
     ).toThrow(/UNIQUE constraint failed/i);
   });
-  it("allows one in-flight import per asset, re-import after a terminal job, and one cleanup per target job", () => {
+  it("allows one in-flight import per asset, re-import after a terminal job, and one active cleanup per target job", () => {
     const database = createEmptyD1();
     applyMigrations(database);
     database.exec(`
@@ -353,5 +353,7 @@ describe("D1 migrations", () => {
     insertCleanup("cleanup-1", "job-1");
     expect(() => insertCleanup("cleanup-2", "job-1")).toThrow(/UNIQUE constraint failed/i);
     expect(() => insertCleanup("cleanup-3", "job-2")).not.toThrow();
+    database.exec("UPDATE jobs SET status = 'COMPLETED' WHERE id = 'cleanup-1'");
+    expect(() => insertCleanup("cleanup-4", "job-1")).not.toThrow();
   });
 });

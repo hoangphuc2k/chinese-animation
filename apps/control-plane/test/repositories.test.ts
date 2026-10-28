@@ -268,6 +268,7 @@ describe("control-plane repositories", () => {
       idempotencyKey: "idem-key-1",
       operation: "APPROVE_SCRIPT",
       requestHash: "request-hash-1",
+      staleBeforeUtc: "2026-08-02T23:55:00Z",
     });
     await repositories.idempotency.complete({
       actorId: "admin-1",
@@ -329,8 +330,16 @@ describe("control-plane repositories", () => {
       },
       {
         method: "first",
-        sql: "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, 0, 'null', ?) ON CONFLICT (actor_id, operation, idempotency_key) DO NOTHING RETURNING id",
-        values: ["idem-1", "admin-1", "APPROVE_SCRIPT", "idem-key-1", "request-hash-1", "2026-08-03T00:00:00Z"],
+        sql: "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, 0, 'null', ?) ON CONFLICT (actor_id, operation, idempotency_key) DO UPDATE SET id = excluded.id, request_hash = excluded.request_hash, created_at = excluded.created_at WHERE idempotency_records.response_status = 0 AND idempotency_records.created_at < ? RETURNING id",
+        values: [
+          "idem-1",
+          "admin-1",
+          "APPROVE_SCRIPT",
+          "idem-key-1",
+          "request-hash-1",
+          "2026-08-03T00:00:00Z",
+          "2026-08-02T23:55:00Z",
+        ],
       },
       {
         method: "run",

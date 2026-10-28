@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { IdempotencyRepository } from "../src/repositories/idempotency";
+import { createMigratedD1 } from "./sqlite-d1";
 import {
+  createIdempotencyStore,
   IdempotencyConflictError,
   IdempotencyInProgressError,
   IdempotencyService,
@@ -152,5 +155,40 @@ describe("idempotent mutation service", () => {
     await expect(service.execute(input, async () => ({ body: { jobId: "job-1" }, status: 202 }))).resolves.toMatchObject({
       replayed: false,
     });
+  });
+});
+
+describe("idempotency records in D1", () => {
+  it("reclaims a pending key abandoned by a crashed request only after the stale window", async () => {
+    const database = createMigratedD1();
+    const store = createIdempotencyStore(new IdempotencyRepository(database));
+    let now = "2026-10-26T00:00:00.000Z";
+    const service = new IdempotencyService(store, undefined, () => now);
+    const input = {
+      actorId: "admin-1",
+      body: { title: "Pilot" },
+      idempotencyKey: "client-key-crash",
+      operation: "CREATE_IMPORT",
+      route: "/api/v1/projects/project-1/imports",
+    };
+    // The first request reserves the key and then never finishes (the Worker died mid-mutation).
+    void service.execute(input, () => new Promise(() => undefined));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    now = "2026-10-26T00:01:00.000Z";
+    await expect(service.execute(input, async () => ({ body: { jobId: "job-1" }, status: 202 }))).rejects.toBeInstanceOf(
+      IdempotencyInProgressError,
+    );
+
+    now = "2026-10-26T00:10:00.000Z";
+    await expect(service.execute(input, async () => ({ body: { jobId: "job-1" }, status: 202 }))).resolves.toMatchObject({
+      body: { jobId: "job-1" },
+      replayed: false,
+    });
+    await expect(service.execute(input, async () => ({ body: { jobId: "job-2" }, status: 202 }))).resolves.toMatchObject({
+      body: { jobId: "job-1" },
+      replayed: true,
+    });
+    database.close();
   });
 });

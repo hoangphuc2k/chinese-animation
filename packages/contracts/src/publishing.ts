@@ -13,7 +13,10 @@ export const DestinationMetadata = z.discriminatedUnion("destination", [
   z.object({
     destination: z.literal("FACEBOOK"),
     caption: z.string().min(1),
-    hashtags: z.array(z.string().regex(/^#[\p{L}\p{M}\p{N}_]+$/u)).max(100),
+    // Must accept exactly what the agent's validate_destination_metadata accepts (NFC, then str.isalnum or "_").
+    hashtags: z
+      .array(z.string().refine((value) => /^#[\p{L}\p{N}_]+$/u.test(value.normalize("NFC")), "invalid hashtag"))
+      .max(100),
   }).strict(),
 ]);
 export type DestinationMetadata = z.infer<typeof DestinationMetadata>;

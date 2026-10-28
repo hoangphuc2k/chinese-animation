@@ -5,8 +5,13 @@ import type { JobType, ProcessingState } from "../../../packages/contracts/src/s
 import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import type { AuthContext } from "../src/middleware/access-auth";
 import { RetentionService } from "../src/scheduled/retention";
-import { ApprovalService, ApprovalMismatchError } from "../src/services/approval-service";
-import { ActiveImportExistsError, JobService, SourceRightsRevokedError } from "../src/services/job-service";
+import { ApprovalService, ApprovalMismatchError, DestinationInFlightError } from "../src/services/approval-service";
+import {
+  ActiveImportExistsError,
+  JobService,
+  SourceOwnedByAnotherProjectError,
+  SourceRightsRevokedError,
+} from "../src/services/job-service";
 import { LeaseService, type ClaimedLease, type LeaseDatabase } from "../src/services/lease-service";
 import { createMigratedD1, type SqliteD1 } from "./sqlite-d1";
 
@@ -239,8 +244,8 @@ describe("cross-plane job lifecycle", () => {
     ).rejects.toBeInstanceOf(ApprovalMismatchError);
   });
 
-  it("caps automated attempts per step and sweeps exhausted jobs to manual review", async () => {
-    const { advance, claim, database, importVideo, job, retention } = setup();
+  it("caps automated attempts per step, fails exhausted jobs, and lets the admin retry them", async () => {
+    const { advance, claim, database, importVideo, job, jobs, retention } = setup();
     const { jobId } = await importVideo();
     await advance("QUEUED", "INGESTING");
     expect(job(jobId).attempt_count).toBe(0);
@@ -249,7 +254,186 @@ describe("cross-plane job lifecycle", () => {
     expect(await claim("INGESTING")).toBeNull();
 
     await retention.run({ nowUtc: plusSeconds(t0, 60), requestId: "00000000-0000-4000-8000-000000000996" });
-    expect(job(jobId)).toMatchObject({ status: "MANUAL_REVIEW_REQUIRED", step: "ATTEMPTS_EXHAUSTED" });
+    // FAILED is retryable and starts the failed-artifact retention window; manual review has no exit before a script exists.
+    expect(job(jobId)).toMatchObject({
+      retention_deadline: plusSeconds(t0, 60 + 7 * 24 * 3600),
+      status: "FAILED",
+      step: "ATTEMPTS_EXHAUSTED",
+    });
+
+    await jobs.retry({
+      actorId: "admin",
+      actorType: "admin",
+      eventId: "00000000-0000-4000-8000-000000000900",
+      expectedState: "FAILED",
+      expectedVersion: job(jobId).version,
+      jobId,
+      nowUtc: plusSeconds(t0, 120),
+      operation: "RETRIED",
+      requestId: "00000000-0000-4000-8000-000000000901",
+    });
+    expect(job(jobId)).toMatchObject({ attempt_count: 0, status: "QUEUED" });
+    expect(await claim("QUEUED", plusSeconds(t0, 121))).not.toBeNull();
+  });
+
+  it("moves exhausted cleanup jobs to FAILED and reschedules cleanup on the next sweep", async () => {
+    const { database, importVideo, job, retention } = setup();
+    const { jobId } = await importVideo();
+    database.sqlite.exec(`UPDATE jobs SET status = 'READY_FOR_PREVIEW', retention_deadline = '${t0}' WHERE id = '${jobId}'`);
+    await retention.run({ nowUtc: plusSeconds(t0, 1), requestId: "00000000-0000-4000-8000-000000000990" });
+    const firstCleanup = database.sqlite.prepare("SELECT id FROM jobs WHERE job_type = 'DELETE_EXPIRED'").get() as { id: string };
+    database.sqlite.exec(`UPDATE jobs SET attempt_count = 5 WHERE id = '${firstCleanup.id}'`);
+
+    await retention.run({ nowUtc: plusSeconds(t0, 2), requestId: "00000000-0000-4000-8000-000000000991" });
+    expect(job(firstCleanup.id).status).toBe("FAILED");
+    await retention.run({ nowUtc: plusSeconds(t0, 3), requestId: "00000000-0000-4000-8000-000000000992" });
+
+    const cleanups = database.sqlite
+      .prepare("SELECT status FROM jobs WHERE job_type = 'DELETE_EXPIRED' AND target_job_id = ? ORDER BY created_at, id")
+      .all(jobId);
+    expect(cleanups).toHaveLength(2);
+    expect(cleanups).toContainEqual({ status: "QUEUED" });
+  });
+
+  it("expires and cleans up a retried job again after its earlier cleanup finished", async () => {
+    const { claim, complete, database, importVideo, job, jobs, retention } = setup();
+    const { jobId } = await importVideo();
+    database.sqlite.exec(`UPDATE jobs SET status = 'FAILED', retention_deadline = '${t0}' WHERE id = '${jobId}'`);
+    await retention.run({ nowUtc: plusSeconds(t0, 1), requestId: "00000000-0000-4000-8000-000000000980" });
+    const firstCleanup = await claim("QUEUED", plusSeconds(t0, 2), ["DELETE_EXPIRED"]);
+    await complete(firstCleanup!, "COMPLETED", {}, plusSeconds(t0, 2));
+
+    await jobs.retry({
+      actorId: "admin",
+      actorType: "admin",
+      eventId: "00000000-0000-4000-8000-000000000902",
+      expectedState: "FAILED",
+      expectedVersion: job(jobId).version,
+      jobId,
+      nowUtc: plusSeconds(t0, 10),
+      operation: "RETRIED",
+      requestId: "00000000-0000-4000-8000-000000000903",
+    });
+    const laterDeadline = plusSeconds(t0, 8 * 24 * 3600);
+    database.sqlite.exec(`UPDATE jobs SET status = 'READY_FOR_PREVIEW', retention_deadline = '${laterDeadline}' WHERE id = '${jobId}'`);
+    await retention.run({ nowUtc: plusSeconds(laterDeadline, 1), requestId: "00000000-0000-4000-8000-000000000981" });
+
+    expect(job(jobId).status).toBe("EXPIRED");
+    expect(
+      database.sqlite.prepare("SELECT COUNT(*) AS count FROM jobs WHERE job_type = 'DELETE_EXPIRED' AND target_job_id = ?").get(jobId),
+    ).toEqual({ count: 2 });
+  });
+
+  it("cancels a pending cleanup when the admin retries its target, and never claims cleanup for a live job", async () => {
+    const { claim, database, importVideo, job, jobs, retention } = setup();
+    const { jobId } = await importVideo();
+    database.sqlite.exec(`UPDATE jobs SET status = 'FAILED', retention_deadline = '${t0}' WHERE id = '${jobId}'`);
+    await retention.run({ nowUtc: plusSeconds(t0, 1), requestId: "00000000-0000-4000-8000-000000000970" });
+
+    await jobs.retry({
+      actorId: "admin",
+      actorType: "admin",
+      eventId: "00000000-0000-4000-8000-000000000904",
+      expectedState: "FAILED",
+      expectedVersion: job(jobId).version,
+      jobId,
+      nowUtc: plusSeconds(t0, 5),
+      operation: "RETRIED",
+      requestId: "00000000-0000-4000-8000-000000000905",
+    });
+
+    expect(database.sqlite.prepare("SELECT status FROM jobs WHERE job_type = 'DELETE_EXPIRED'").get()).toEqual({ status: "CANCELLED" });
+    database.sqlite.exec("UPDATE jobs SET status = 'QUEUED' WHERE job_type = 'DELETE_EXPIRED'");
+    expect(await claim("QUEUED", plusSeconds(t0, 6), ["DELETE_EXPIRED"])).toBeNull();
+  });
+
+  it("refuses to approve an edited script version that the agent cannot voice", async () => {
+    const { approvals, claim, complete, importVideo, job, runToTranslation } = setup();
+    const { jobId } = await importVideo();
+    await runToTranslation();
+    await complete((await claim("TRANSLATING"))!, "WAITING_SCRIPT_REVIEW", { pipelineArtifacts: [artifact("SCRIPT", "5")] });
+    await approvals.saveScriptEdit({
+      actorId: "admin",
+      contentHash: sha("e"),
+      jobId,
+      metadataHash: null,
+      nowUtc: t0,
+      requestId: "00000000-0000-4000-8000-000000000960",
+      scriptId: "00000000-0000-4000-8000-000000000961",
+      transcriptHash: null,
+      translationHash: null,
+      voiceSettingsHash: null,
+    });
+
+    await expect(
+      approvals.approveScript({
+        actorId: "admin",
+        contentHash: sha("e"),
+        jobId,
+        nowUtc: t0,
+        requestId: "00000000-0000-4000-8000-000000000962",
+        scriptVersion: 2,
+      }),
+    ).rejects.toBeInstanceOf(ApprovalMismatchError);
+    expect(job(jobId).status).toBe("WAITING_SCRIPT_REVIEW");
+  });
+
+  it("does not let a new publish approval supersede another destination's in-flight upload", async () => {
+    const { approvals, database, importVideo } = setup();
+    const { jobId } = await importVideo();
+    const renderId = "00000000-0000-4000-8000-000000000950";
+    database.sqlite.exec(`UPDATE jobs SET status = 'WAITING_PUBLISH_APPROVAL' WHERE id = '${jobId}'`);
+    database.sqlite.exec(
+      `INSERT INTO render_versions (id, job_id, version, render_hash, byte_count, artifact_ref, created_at) VALUES ('${renderId}', '${jobId}', 1, '${sha("9")}', 10, 'render-01', '${t0}')`,
+    );
+    const approve = (destination: string) =>
+      approvals.approvePublish({
+        actorId: "admin",
+        destinations: [destination],
+        jobId,
+        metadataHash: sha("a"),
+        nowUtc: t0,
+        renderId,
+        renderVersion: 1,
+        requestId: "00000000-0000-4000-8000-000000000951",
+        scheduleAtUtc: null,
+      });
+    await approve("YOUTUBE");
+    database.sqlite.exec(`UPDATE destination_publications SET status = 'UPLOADING' WHERE destination = 'YOUTUBE'`);
+
+    await expect(approve("FACEBOOK")).rejects.toBeInstanceOf(DestinationInFlightError);
+    expect(
+      database.sqlite
+        .prepare("SELECT COUNT(*) AS count FROM approvals WHERE approval_type = 'PUBLISH_APPROVED' AND invalidated_at IS NULL")
+        .get(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("refuses to re-import another project's source into this project", async () => {
+    const { database, importVideo, jobs } = setup();
+    await importVideo();
+    database.sqlite.exec("UPDATE jobs SET status = 'COMPLETED'");
+    const otherProject = "00000000-0000-4000-8000-000000000002";
+    database.sqlite.exec(
+      `INSERT INTO projects (id, name, status, created_at, updated_at) VALUES ('${otherProject}', 'Other', 'ACTIVE', '${t0}', '${t0}')`,
+    );
+
+    await expect(
+      jobs.createImport({
+        actorId: "admin",
+        actorType: "admin",
+        allowedProcessors: [],
+        jobId: "00000000-0000-4000-8000-000000000940",
+        nowUtc: t0,
+        projectId: otherProject,
+        requestId: "00000000-0000-4000-8000-000000000941",
+        rightsEvidence: "licence",
+        sourceAssetId: "00000000-0000-4000-8000-000000000942",
+        sourceExternalId: url,
+        sourceMetadataJson: JSON.stringify({ locator: { kind: "CREATOR_HTTPS_URL", url } }),
+        sourceProvider: "CREATOR_HTTPS_URL",
+      }),
+    ).rejects.toBeInstanceOf(SourceOwnedByAnotherProjectError);
   });
 
   it("records an agent failure code and starts the failed-artifact retention window", async () => {

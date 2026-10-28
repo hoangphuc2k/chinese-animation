@@ -16,6 +16,7 @@ import {
   ActiveImportExistsError,
   JobService,
   RetryNotAllowedError,
+  SourceOwnedByAnotherProjectError,
   SourceRightsRevokedError,
   StaleWorkflowError,
   type WorkflowDatabase,
@@ -256,6 +257,7 @@ export function createBrowserWorkflowRoutes(options: BrowserWorkflowRoutesOption
       if (error instanceof IdempotencyConflictError) return problem("CONFLICT", error.message, requestId(), 409);
       if (error instanceof ActiveImportExistsError) return problem("CONFLICT", error.message, requestId(), 409);
       if (error instanceof SourceRightsRevokedError) return problem("RIGHTS_BLOCKED", error.message, requestId(), 409);
+      if (error instanceof SourceOwnedByAnotherProjectError) return problem("CONFLICT", error.message, requestId(), 409);
       throw error;
     }
   });

@@ -21,6 +21,7 @@ export interface ReserveIdempotencyRecordInput extends FindIdempotencyRecordInpu
   createdAtUtc: string;
   id: string;
   requestHash: string;
+  staleBeforeUtc: string;
 }
 
 export interface CompleteIdempotencyRecordInput extends FindIdempotencyRecordInput {
@@ -40,13 +41,24 @@ export class IdempotencyRepository {
       .first<IdempotencyRecord>();
   }
 
-  /** Inserts a pending record; the unique key makes concurrent duplicates lose atomically. */
+  /**
+   * Inserts a pending record; the unique key makes concurrent duplicates lose atomically. A pending record
+   * older than `staleBeforeUtc` belongs to a request that died, so it is taken over instead.
+   */
   async reserve(input: ReserveIdempotencyRecordInput): Promise<boolean> {
     const inserted = await this.database
       .prepare(
-        "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, 0, 'null', ?) ON CONFLICT (actor_id, operation, idempotency_key) DO NOTHING RETURNING id",
+        "INSERT INTO idempotency_records (id, actor_id, operation, idempotency_key, request_hash, response_status, response_json, created_at) VALUES (?, ?, ?, ?, ?, 0, 'null', ?) ON CONFLICT (actor_id, operation, idempotency_key) DO UPDATE SET id = excluded.id, request_hash = excluded.request_hash, created_at = excluded.created_at WHERE idempotency_records.response_status = 0 AND idempotency_records.created_at < ? RETURNING id",
       )
-      .bind(input.id, input.actorId, input.operation, input.idempotencyKey, input.requestHash, input.createdAtUtc)
+      .bind(
+        input.id,
+        input.actorId,
+        input.operation,
+        input.idempotencyKey,
+        input.requestHash,
+        input.createdAtUtc,
+        input.staleBeforeUtc,
+      )
       .first<{ id: string }>();
     return inserted !== null;
   }
