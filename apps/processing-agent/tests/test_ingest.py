@@ -227,3 +227,47 @@ def test_https_ingest_still_rejects_non_redirect_error_responses(tmp_path: Path)
             resolver=resolve_fixture,
             connection_factory=server.connect,
         )
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_https_ingest_reports_server_outages_as_transient(tmp_path: Path, status: int) -> None:
+    from localizer_agent.ingest import SourceUnavailableError
+
+    server = FakeServer({("creator.example.test", "/video.mp4"): FakeResponse(status)})
+
+    with pytest.raises(SourceUnavailableError):
+        ingest_https_url(
+            "https://creator.example.test/video.mp4",
+            tmp_path / "source.bin",
+            max_bytes=1024,
+            timeout_seconds=7,
+            resolver=resolve_fixture,
+            connection_factory=server.connect,
+        )
+
+
+def test_https_ingest_reports_dns_failure_as_transient(tmp_path: Path) -> None:
+    from localizer_agent.ingest import SourceUnavailableError
+
+    def failing_resolver(host: str) -> list[str]:
+        raise OSError("temporary DNS failure")
+
+    with pytest.raises(SourceUnavailableError):
+        ingest_https_url("https://creator.example.test/video.mp4", tmp_path / "source.bin", 1024, 7, resolver=failing_resolver)
+
+
+def test_https_ingest_keeps_definitive_rejections_deterministic(tmp_path: Path) -> None:
+    from localizer_agent.ingest import SourceUnavailableError
+
+    server = FakeServer({("creator.example.test", "/video.mp4"): FakeResponse(404)})
+
+    with pytest.raises(SourceIntegrityError) as raised:
+        ingest_https_url(
+            "https://creator.example.test/video.mp4",
+            tmp_path / "source.bin",
+            max_bytes=1024,
+            timeout_seconds=7,
+            resolver=resolve_fixture,
+            connection_factory=server.connect,
+        )
+    assert not isinstance(raised.value, SourceUnavailableError)

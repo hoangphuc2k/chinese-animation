@@ -167,3 +167,18 @@ def test_job_type_router_dispatches_queued_claims_by_job_type() -> None:
 
     assert router.job_types == ("IMPORT", "DELETE_EXPIRED")
     assert cleanups.claims == [cleanup_claim] and imports.claims == []
+
+
+def test_transient_source_outages_are_not_reported_as_media_failures() -> None:
+    from localizer_agent.ingest import SourceUnavailableError
+
+    client = CompletingClient(claim())
+    supervisor = ProcessingSupervisor(client, {"TRANSCRIBING": RaisingHandler(SourceUnavailableError("503"))}, supported_job_types=["IMPORT"])
+
+    try:
+        asyncio.run(supervisor.run_once())
+    except SourceUnavailableError:
+        pass
+    else:
+        raise AssertionError("transient source errors must propagate")
+    assert client.completions == []

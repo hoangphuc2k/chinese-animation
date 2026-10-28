@@ -20,6 +20,13 @@ class SourceIntegrityError(ValueError):
     """A source locator or downloaded content is unsafe for ingest."""
 
 
+class SourceUnavailableError(SourceIntegrityError):
+    """The source could not be fetched right now (DNS, network, timeout, 429/5xx); retrying may succeed."""
+
+
+_TRANSIENT_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
 @dataclass(frozen=True)
 class IngestedSource:
     path: Path
@@ -72,7 +79,7 @@ def _validated_https_addresses(url: str, resolver: Callable[[str], list[str]] | 
     try:
         addresses = resolve(parsed.hostname)
     except OSError as error:
-        raise SourceIntegrityError("The source host could not be resolved.") from error
+        raise SourceUnavailableError("The source host could not be resolved.") from error
     if not addresses or any(not _public_address(address) for address in addresses):
         raise SourceIntegrityError("The source host resolved to a non-public address.")
     return parsed, addresses
@@ -177,6 +184,8 @@ def _fetch_pinned(
                 if not location or not location.strip():
                     raise SourceIntegrityError("Source server returned a redirect without a location.")
                 return location.strip()
+            if response.status in _TRANSIENT_STATUSES:
+                raise SourceUnavailableError("Source server is temporarily unavailable.")
             if not 200 <= response.status < 300:
                 raise SourceIntegrityError("Source server returned a non-success response.")
             content_length = response.getheader("Content-Length")
@@ -192,4 +201,4 @@ def _fetch_pinned(
             last_error = error
         finally:
             connection.close()
-    raise SourceIntegrityError("Source server could not be reached.") from last_error
+    raise SourceUnavailableError("Source server could not be reached.") from last_error

@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from localizer_agent.generated.models import ClaimJobResponse, CompleteStepRequest, FailureCode, JobType
-from localizer_agent.ingest import SourceIntegrityError
+from localizer_agent.ingest import SourceIntegrityError, SourceUnavailableError
 from localizer_agent.render.validator import RenderValidationError
 from localizer_agent.subtitles.writer import SubtitleError
 from localizer_agent.transcription.segments import SegmentError
@@ -34,6 +34,8 @@ _DETERMINISTIC_FAILURES: tuple[tuple[type[Exception], str, FailureCode, str], ..
 
 
 def _deterministic_failure(error: Exception) -> tuple[str, FailureCode, str] | None:
+    if isinstance(error, SourceUnavailableError):
+        return None
     for error_type, state, code, step in _DETERMINISTIC_FAILURES:
         if isinstance(error, error_type):
             return state, code, step
