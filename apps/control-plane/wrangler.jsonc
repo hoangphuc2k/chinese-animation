@@ -28,5 +28,37 @@
     "DEPLOYMENT_VERSION": "development",
     "ENVIRONMENT": "development",
     "PREVIEW_ORIGIN": "https://preview.example.invalid"
+  },
+  // Deployed Worker: scripts/wrangler.sh deploy --env production
+  // Migrations:      scripts/wrangler.sh d1 migrations apply localizer-control-plane --remote --env production
+  // `vars` and `d1_databases` are not inherited by environments, so both are repeated here. The
+  // placeholder values below make Access validation reject every request until they are replaced with
+  // the real team domain, Access application AUD tags, admin email and origins.
+  "env": {
+    "production": {
+      "name": "chinese-animation-localizer-control-plane",
+      "triggers": {
+        "crons": ["0 0 * * *"]
+      },
+      "d1_databases": [
+        {
+          "binding": "CONTROL_PLANE_DB",
+          "database_name": "localizer-control-plane",
+          "database_id": "09569c02-2219-4394-8c27-5a482eb53f93",
+          "migrations_dir": "db/migrations"
+        }
+      ],
+      "vars": {
+        "ACCESS_AUDIENCE": "REPLACE-with-admin-Access-application-AUD-tag",
+        "ACCESS_ISSUER": "https://REPLACE-team-name.cloudflareaccess.com",
+        "ADMIN_EMAIL": "REPLACE-with-administrator-email",
+        "ADMIN_ORIGIN": "https://REPLACE-admin-hostname",
+        "AGENT_ACCESS_AUDIENCE": "REPLACE-with-agent-API-Access-application-AUD-tag",
+        "AGENT_SERVICE_CLIENT_ID": "REPLACE-with-service-token-client-id.access",
+        "DEPLOYMENT_VERSION": "production",
+        "ENVIRONMENT": "production",
+        "PREVIEW_ORIGIN": "https://REPLACE-preview-hostname"
+      }
+    }
   }
 }
