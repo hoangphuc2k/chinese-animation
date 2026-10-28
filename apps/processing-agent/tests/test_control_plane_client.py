@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 
-from localizer_agent.control_plane import AgentControlPlaneClient, ControlPlaneError, HttpResponse
+from localizer_agent.control_plane import AccessServiceToken, AgentControlPlaneClient, ControlPlaneError, HttpResponse
 from localizer_agent.generated.models import ClaimJobResponse, CompleteStepRequest
+
+TOKEN = AccessServiceToken(client_id="agent-client.access", client_secret="sensitive-token")
 
 
 class RecordingTransport:
@@ -70,7 +72,7 @@ def test_client_claims_only_import_work_and_completes_sanitized_result() -> None
                 HttpResponse(204, b""),
             ]
         )
-        client = AgentControlPlaneClient("https://control-plane.example.test", "sensitive-token", transport)
+        client = AgentControlPlaneClient("https://control-plane.example.test", TOKEN, transport)
         received = await client.claim_import()
         assert received == claim
         await client.heartbeat(received)
@@ -97,7 +99,9 @@ def test_client_claims_only_import_work_and_completes_sanitized_result() -> None
 
     method, url, headers, body = transport.calls[0]
     assert (method, url) == ("POST", "https://control-plane.example.test/api/v1/agent/jobs/claim")
-    assert headers["Authorization"] == "Bearer sensitive-token"
+    assert headers["CF-Access-Client-Id"] == "agent-client.access"
+    assert headers["CF-Access-Client-Secret"] == "sensitive-token"
+    assert "Authorization" not in headers
     assert json.loads(body or b"{}") == {"supportedJobTypes": ["IMPORT"], "supportedStates": ["QUEUED", "INGESTING"]}
     assert transport.calls[1][1].endswith(f"/jobs/{claim.jobId}/heartbeat")
     assert transport.calls[2][1].endswith(f"/jobs/{claim.jobId}/complete")
@@ -107,7 +111,7 @@ def test_client_returns_no_claim_for_204_and_does_not_expose_response_bodies() -
     async def scenario() -> None:
         client = AgentControlPlaneClient(
             "https://control-plane.example.test",
-            "sensitive-token",
+            TOKEN,
             RecordingTransport([HttpResponse(500, b"source url https://secret.example.test")]),
         )
         try:
@@ -124,7 +128,7 @@ def test_client_accepts_a_state_aware_pipeline_claim_for_declared_job_types() ->
     async def scenario() -> tuple[ClaimJobResponse, RecordingTransport]:
         expected = transcription_claim()
         transport = RecordingTransport([HttpResponse(200, expected.model_dump_json().encode())])
-        client = AgentControlPlaneClient("https://control-plane.example.test", "sensitive-token", transport)
+        client = AgentControlPlaneClient("https://control-plane.example.test", TOKEN, transport)
 
         received = await client.claim(["IMPORT"], ["TRANSCRIBING"])
 
@@ -140,7 +144,7 @@ def test_client_accepts_a_state_aware_pipeline_claim_for_declared_job_types() ->
 def test_client_rejects_a_completion_for_a_state_other_than_the_claimed_state() -> None:
     async def scenario() -> None:
         claimed = import_claim()
-        client = AgentControlPlaneClient("https://control-plane.example.test", "sensitive-token", RecordingTransport([]))
+        client = AgentControlPlaneClient("https://control-plane.example.test", TOKEN, RecordingTransport([]))
 
         try:
             await client.complete(
@@ -178,7 +182,7 @@ def test_client_fetches_exact_script_approval_without_sending_script_text() -> N
                 )
             ]
         )
-        client = AgentControlPlaneClient("https://control-plane.example.test", "sensitive-token", transport)
+        client = AgentControlPlaneClient("https://control-plane.example.test", TOKEN, transport)
 
         approval = await client.get_script_approval(
             "00000000-0000-4000-8000-000000000001",
@@ -220,7 +224,7 @@ def test_client_accepts_a_translation_claim_with_state_specific_input() -> None:
         }
         client = AgentControlPlaneClient(
             "https://control-plane.example.test",
-            "sensitive-token",
+            TOKEN,
             RecordingTransport([HttpResponse(200, json.dumps(response).encode())]),
         )
         return await client.claim(["LOCALIZE"], ["TRANSLATING"])
