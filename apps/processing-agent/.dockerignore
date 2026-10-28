@@ -8,3 +8,5 @@
 tests
 *.mp4
 *.wav
+build
+**/*.egg-info

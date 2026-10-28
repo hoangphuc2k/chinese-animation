@@ -295,6 +295,11 @@ that processing and identifies Gemini/Google as a processor. Otherwise the job
 stops at manual translation; it does not silently send content to another
 provider.
 
+Interim implementation (until the structured permission record exists): the
+import request carries `allowedProcessors` (default none). Without
+`GOOGLE_GEMINI` the job moves to `MANUAL_REVIEW_REQUIRED` with step
+`TRANSLATION_CONSENT_MISSING` instead of being claimed for translation.
+
 The preferred production path remains creator-supplied clean files. If an
 adapter fails or platform terms do not permit downloading, the source changes
 to manual file delivery without changing the downstream pipeline.
@@ -712,7 +717,13 @@ Retry policy:
 - Mutating administrator requests are same-origin only and require CSRF
   protection in addition to Access authentication.
 - OCI agent uses a renewable Access service token accepted only by the agent API
-  hostname and least-privilege routes.
+  hostname and least-privilege routes. The agent sends it as the
+  `CF-Access-Client-Id`/`CF-Access-Client-Secret` header pair; the Worker
+  accepts only service JWTs whose `common_name` is the configured client ID and
+  whose `sub` is empty.
+- Administrator identity is the allowlisted email in the Access JWT; no custom
+  roles claim is required. CSRF tokens are issued by `GET /api/v1/csrf-token`
+  and bound to the administrator application's origin.
 - Provider keys, source cookies and OAuth tokens are stored in OCI Vault and
   accessed by instance principal; Worker-only signing secrets use Cloudflare
   secrets. No secret is stored in D1, logs, source code or frontend bundles.
