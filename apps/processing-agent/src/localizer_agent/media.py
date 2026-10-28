@@ -25,9 +25,22 @@ class CommandRunner(Protocol):
 
 
 class SubprocessRunner:
+    """Runs media tools below the agent's priority, so a CPU-saturating ffmpeg or whisper.cpp
+    cannot starve the lease heartbeat and lose the job's lease mid-stage."""
+
+    def __init__(self, niceness: int = 10) -> None:
+        self._niceness = niceness
+
     def run(self, arguments: list[str], timeout_seconds: int) -> CommandResult:
         try:
-            result = subprocess.run(arguments, capture_output=True, check=False, shell=False, text=True, timeout=timeout_seconds)  # noqa: S603
+            result = subprocess.run(  # noqa: S603
+                ["nice", "-n", str(self._niceness), *arguments],
+                capture_output=True,
+                check=False,
+                shell=False,
+                text=True,
+                timeout=timeout_seconds,
+            )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise MediaError("Media command could not be completed.") from error
         return CommandResult(result.returncode, result.stdout, result.stderr)

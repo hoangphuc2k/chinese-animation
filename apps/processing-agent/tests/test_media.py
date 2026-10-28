@@ -47,3 +47,15 @@ def test_media_processor_rejects_invalid_probe_metadata(tmp_path: Path) -> None:
 
     with pytest.raises(MediaError):
         MediaProcessor(runner, timeout_seconds=60).probe(tmp_path / "source.bin")
+
+
+def test_subprocess_runner_lowers_child_priority_so_heartbeats_are_not_starved() -> None:
+    import os
+    import sys
+
+    from localizer_agent.media import SubprocessRunner
+
+    result = SubprocessRunner().run([sys.executable, "-c", "import os; print(os.nice(0))"], timeout_seconds=10)
+
+    assert result.return_code == 0
+    assert int(result.stdout.strip()) >= os.nice(0) + 10
