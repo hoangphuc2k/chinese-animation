@@ -13,9 +13,33 @@ export const DestinationMetadata = z.discriminatedUnion("destination", [
   z.object({
     destination: z.literal("FACEBOOK"),
     caption: z.string().min(1),
-    hashtags: z.array(z.string().regex(/^#[A-Za-z0-9_]+$/)).max(100),
+    hashtags: z.array(z.string().regex(/^#[\p{L}\p{M}\p{N}_]+$/u)).max(100),
   }).strict(),
 ]);
+export type DestinationMetadata = z.infer<typeof DestinationMetadata>;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * SHA-256 of the destination metadata the administrator approves. It must stay byte-identical to the
+ * processing agent's `metadata_sha256`: entries sorted by destination, keys sorted, compact, UTF-8.
+ */
+export async function publishMetadataHash(metadata: readonly DestinationMetadata[]): Promise<string> {
+  const entries = [...metadata].sort((left, right) => left.destination.localeCompare(right.destination));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalJson(entries)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 const Schedule = z
   .string()
   .datetime({ offset: false })

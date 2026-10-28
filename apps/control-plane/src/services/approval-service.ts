@@ -72,6 +72,15 @@ export class ApprovalMismatchError extends Error {
   }
 }
 
+export class DestinationInFlightError extends Error {
+  constructor() {
+    super("A requested destination is already uploading, staged, or published and cannot be re-approved.");
+  }
+}
+
+/** Destination states from which a fresh publish approval may (re)start the upload. */
+const reapprovableDestinationStates = ["NOT_REQUESTED", "READY_TO_UPLOAD", "FAILED"] as const;
+
 export class ApprovalService {
   constructor(
     private readonly database: ApprovalDatabase,
@@ -245,6 +254,15 @@ export class ApprovalService {
       .bind(input.renderId, input.jobId, input.renderVersion)
       .first<RenderVersionRow>();
     if (!render) throw new ApprovalMismatchError();
+    const job = await this.database.prepare("SELECT status FROM jobs WHERE id = ?").bind(input.jobId).first<{ status: string }>();
+    if (job?.status !== "WAITING_PUBLISH_APPROVAL") throw new ApprovalMismatchError();
+    const inFlight = await this.database
+      .prepare(
+        `SELECT destination FROM destination_publications WHERE job_id = ? AND destination IN (${input.destinations.map(() => "?").join(", ")}) AND status NOT IN (${reapprovableDestinationStates.map(() => "?").join(", ")}) LIMIT 1`,
+      )
+      .bind(input.jobId, ...input.destinations, ...reapprovableDestinationStates)
+      .first<{ destination: string }>();
+    if (inFlight) throw new DestinationInFlightError();
     const approvalId = this.newId();
     const statements = [
       this.database
@@ -271,7 +289,7 @@ export class ApprovalService {
       ...input.destinations.map((destination) =>
         this.database
           .prepare(
-            "INSERT INTO destination_publications (id, job_id, destination, provider_asset_id, provider_session_id, render_version_id, status, metadata_hash, scheduled_at_utc, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, destination) DO UPDATE SET render_version_id = excluded.render_version_id, status = excluded.status, metadata_hash = excluded.metadata_hash, scheduled_at_utc = excluded.scheduled_at_utc, updated_at = excluded.updated_at",
+            "INSERT INTO destination_publications (id, job_id, destination, provider_asset_id, provider_session_id, render_version_id, status, metadata_hash, scheduled_at_utc, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, destination) DO UPDATE SET render_version_id = excluded.render_version_id, status = excluded.status, metadata_hash = excluded.metadata_hash, scheduled_at_utc = excluded.scheduled_at_utc, updated_at = excluded.updated_at WHERE destination_publications.status IN ('NOT_REQUESTED', 'READY_TO_UPLOAD', 'FAILED')",
           )
           .bind(
             this.newId(),
