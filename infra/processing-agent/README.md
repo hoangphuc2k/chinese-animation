@@ -88,7 +88,7 @@ If a required variable is missing, the deploy fails immediately with a message t
    - `ADMIN_ORIGIN`, `ADMIN_EMAIL`, `ACCESS_AUDIENCE` and `ACCESS_ISSUER`.
    - The `CSRF_SIGNING_SECRET` secret, set with `wrangler secret put CSRF_SIGNING_SECRET`.
 4. **D1:** create the database, put its `database_id` in `wrangler.jsonc`, then run
-   `wrangler d1 migrations apply <database> --remote`. That applies migrations 0001–0007.
+   `wrangler d1 migrations apply <database> --remote`. That applies migrations 0001–0008.
    Then deploy with `wrangler deploy`.
 
 ## 5. Check that it works

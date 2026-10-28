@@ -62,7 +62,7 @@ There are two execution planes. They talk only through the versioned `/api/v1` H
   - Import stores `allowedProcessors` in `source_assets.rights_metadata_json`; without `GOOGLE_GEMINI`, `TRANSCRIBING → TRANSLATING` is redirected to `MANUAL_REVIEW_REQUIRED`.
   - Completing `TRANSLATING → WAITING_SCRIPT_REVIEW` creates `script_versions` v1 from the agent's SCRIPT artifact hash. `approveScript` (latest version, review state only) moves the job to `GENERATING_VOICE`.
   - `READY_FOR_PREVIEW` and `FAILED` set `retention_deadline` (+7 days). The cron expires or cleans up past it by inserting a `DELETE_EXPIRED` job keyed by `target_job_id`.
-  - Claims stop at `attempt_count >= 5` per step (reset on each completion); the cron moves those jobs to `MANUAL_REVIEW_REQUIRED`.
+  - Claims stop at `attempt_count >= 5` per step (reset on each completion and on retry); the cron moves those jobs to `FAILED` (retryable, with a retention window). Retry also clears the deadline and cancels a pending cleanup; cleanup is only claimed for a terminal target.
   - Publish approval recomputes the metadata hash with `publishMetadataHash` (`packages/contracts/src/publishing.ts`), which must stay byte-identical to the agent's `metadata_sha256`.
 - No UI code exists yet. Phase 07 will add Vite + Preact served as Worker static assets.
 
@@ -87,10 +87,10 @@ There are two execution planes. They talk only through the versioned `/api/v1` H
 
 ## Database (D1)
 
-- Migrations are in `apps/control-plane/db/migrations/0001…0007`. They are monotonic: never edit a committed migration, add a new one plus a test in `test/migrations.test.ts`.
+- Migrations are in `apps/control-plane/db/migrations/0001…0008`. They are monotonic: never edit a committed migration, add a new one plus a test in `test/migrations.test.ts`.
 - Tables:
   - `projects`, `source_assets`
-  - `jobs`, which has `status`, `version`, lease columns, `attempt_count`, `retention_deadline`, `pipeline_lineage_json` and `target_job_id` (cleanup jobs); partial unique indexes allow one active IMPORT per asset and one cleanup per target
+  - `jobs`, which has `status`, `version`, lease columns, `attempt_count`, `retention_deadline`, `pipeline_lineage_json` and `target_job_id` (cleanup jobs); partial unique indexes allow one active IMPORT per asset and one active cleanup per target
   - `job_events`, `script_versions`, `render_versions`
   - `destination_publications`, unique on `(job_id, destination)`; `rights_review_required_at` flags published content after revocation
   - `approvals`, `idempotency_records`

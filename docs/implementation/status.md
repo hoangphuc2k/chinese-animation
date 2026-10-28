@@ -16,7 +16,7 @@
   - CSRF origin and token endpoint.
   - Gemini consent at import, with a manual-review stop instead of a claim loop.
   - Script approval advancing the job; server-created script versions; `GET /jobs/:id`.
-  - Retention deadlines, guarded retention batches, per-target cleanup (migration 0007) and the agent `DELETE_EXPIRED` handler.
+  - Retention deadlines, guarded retention batches, per-target cleanup (migrations 0007–0008) and the agent `DELETE_EXPIRED` handler.
   - Revocation for every job type, with published destinations flagged.
   - Safe re-import.
   - Atomic idempotency.
@@ -24,4 +24,4 @@
   - Per-step attempt cap and deterministic failure reporting.
   - HTTPS redirect revalidation, pitch-preserving voice tempo, Facebook retry/status bugs, Unicode hashtags.
 - Deployment: Portainer stack in `infra/processing-agent/` and the `agent-image` workflow.
-- Still open: preview delivery (P0-5), publishing wiring (P0-7), OCI Vault secrets. Every PoC gate is still `BLOCKED`; nothing here has run against native D1 or real providers. CI applies migration 0007 to local D1.
+- Still open: preview delivery (P0-5), publishing wiring (P0-7), OCI Vault secrets. Every PoC gate is still `BLOCKED`; nothing here has run against native D1 or real providers. CI applies migrations 0007–0008 to local D1.
