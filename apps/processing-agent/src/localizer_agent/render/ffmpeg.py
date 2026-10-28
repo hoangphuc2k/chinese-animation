@@ -23,15 +23,23 @@ def _filter_path(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
-def build_render_command(inputs: RenderInputs) -> list[str]:
+def build_render_command(inputs: RenderInputs, *, source_duration_seconds: float) -> list[str]:
+    if source_duration_seconds <= 0:
+        raise MediaError("Render requires a positive source duration.")
     inputs.destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     subtitle_path = _filter_path(inputs.subtitles)
+    duration = f"{source_duration_seconds:.3f}"
     filters = (
         f"[0:v]subtitles='{subtitle_path}':charenc=UTF-8[captioned];"
-        "[captioned][2:v]overlay=30:30:format=auto[video];"
-        "[0:a]volume=0.18[ambience];"
+        # The watermark is one PNG frame; eof_action=repeat keeps it on screen for the whole video.
+        # Never `-loop 1` it: a looped image never ends and ffmpeg then renders forever.
+        "[captioned][2:v]overlay=30:30:eof_action=repeat:format=auto[video];"
+        # Audio is bounded to the source video's duration: the ambience is padded with silence when the
+        # source audio track is shorter, and the mix is trimmed so over-long narration cannot outlast
+        # the video. `-shortest` is not used; it does not reliably stop this filter graph.
+        f"[0:a]volume=0.18,apad=whole_dur={duration}[ambience];"
         "[1:a]aresample=48000[voice];"
-        "[ambience][voice]amix=inputs=2:duration=first:dropout_transition=0[audio]"
+        f"[ambience][voice]amix=inputs=2:duration=first:dropout_transition=0,atrim=end={duration}[audio]"
     )
     return [
         "ffmpeg",
@@ -42,8 +50,6 @@ def build_render_command(inputs: RenderInputs) -> list[str]:
         str(inputs.normalized_media),
         "-i",
         str(inputs.narration),
-        "-loop",
-        "1",
         "-i",
         str(inputs.watermark),
         "-filter_complex",
@@ -60,7 +66,6 @@ def build_render_command(inputs: RenderInputs) -> list[str]:
         "aac",
         "-movflags",
         "+faststart",
-        "-shortest",
         # Stage outputs are written to `*.tmp` candidates, so the muxer cannot be inferred from the name.
         "-f",
         "mp4",
@@ -73,10 +78,27 @@ class RenderExecutor:
         self._runner = runner or SubprocessRunner()
         self._timeout_seconds = timeout_seconds
 
-    def render(self, inputs: RenderInputs) -> None:
-        result = self._runner.run(build_render_command(inputs), self._timeout_seconds)
+    def render(self, inputs: RenderInputs, source_duration_seconds: float) -> None:
+        result = self._runner.run(
+            build_render_command(inputs, source_duration_seconds=source_duration_seconds), self._timeout_seconds
+        )
         if result.return_code != 0:
             raise MediaError("FFmpeg render failed.")
+
+
+def _probe_duration_seconds(runner: CommandRunner, media: Path, timeout_seconds: int) -> float:
+    result = runner.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(media)], timeout_seconds
+    )
+    if result.return_code != 0:
+        raise MediaError("FFprobe could not read the source duration.")
+    try:
+        duration = float(json.loads(result.stdout)["format"]["duration"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise MediaError("FFprobe returned an invalid source duration.") from error
+    if duration <= 0:
+        raise MediaError("Source media has no positive duration.")
+    return duration
 
 
 class FfmpegRenderOperations:
@@ -85,8 +107,11 @@ class FfmpegRenderOperations:
         self._timeout_seconds = timeout_seconds
         self._executor = RenderExecutor(self._runner, timeout_seconds)
 
+    def _source_duration_seconds(self, media: Path) -> float:
+        return _probe_duration_seconds(self._runner, media, self._timeout_seconds)
+
     def render(self, inputs: RenderInputs) -> None:
-        self._executor.render(inputs)
+        self._executor.render(inputs, self._source_duration_seconds(inputs.normalized_media))
         result = self._runner.run(
             [
                 "ffprobe",
