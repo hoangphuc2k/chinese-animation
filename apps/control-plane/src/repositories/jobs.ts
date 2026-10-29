@@ -14,6 +14,18 @@ export interface JobRow extends Record<string, unknown> {
   version: number;
 }
 
+export interface JobDetailRow extends Record<string, unknown> {
+  id: string;
+  job_type: string;
+  last_event_type: string | null;
+  latest_script_hash: string | null;
+  latest_script_version: number | null;
+  retention_deadline: string | null;
+  status: string;
+  step: string;
+  version: number;
+}
+
 export interface CreateJobInput {
   availableAtUtc: string;
   createdAtUtc: string;
@@ -73,6 +85,15 @@ export class JobsRepository {
 
   async get(id: string): Promise<JobRow | null> {
     return this.database.prepare("SELECT * FROM jobs WHERE id = ?").bind(id).first<JobRow>();
+  }
+
+  async getDetail(id: string): Promise<JobDetailRow | null> {
+    return this.database
+      .prepare(
+        "SELECT id, job_type, status, step, version, retention_deadline, (SELECT version FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS latest_script_version, (SELECT content_hash FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS latest_script_hash, (SELECT event_type FROM job_events WHERE job_id = jobs.id ORDER BY created_at DESC, id DESC LIMIT 1) AS last_event_type FROM jobs WHERE id = ?",
+      )
+      .bind(id)
+      .first<JobDetailRow>();
   }
 
   async listRunnable(input: ListRunnableJobsInput): Promise<JobRow[]> {

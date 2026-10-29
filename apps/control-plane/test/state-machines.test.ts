@@ -59,6 +59,10 @@ describe("job state machine", () => {
     expect(() => assertJobTransition("CANCELLED", "INGESTING")).toThrow(JobTransitionError);
   });
 
+  it("lets subtitle-rule failures during mixing stop for manual review", () => {
+    expect(() => assertJobTransition("MIXING", "MANUAL_REVIEW_REQUIRED")).not.toThrow();
+  });
+
   it("routes voice approval and timing exceptions back to human review", () => {
     expect(() => assertJobTransition("GENERATING_VOICE", "WAITING_SCRIPT_REVIEW")).not.toThrow();
     expect(() => assertJobTransition("GENERATING_VOICE", "TIMING_REVIEW_REQUIRED")).not.toThrow();

@@ -45,6 +45,13 @@ class PreviewRegistry:
         if self._records.pop(token, None) is not None:
             self._persist()
 
+    def revoke_job(self, job_id: str) -> None:
+        tokens = [token for token, record in self._records.items() if record.job_id == job_id]
+        for token in tokens:
+            del self._records[token]
+        if tokens:
+            self._persist()
+
     def _load(self) -> dict[str, PreviewRecord]:
         if self._storage_path is None or not self._storage_path.exists():
             return {}

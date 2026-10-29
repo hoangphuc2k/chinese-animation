@@ -1,4 +1,12 @@
-import { ImportInput, IngestResult, PipelineArtifact, PipelineClaimInput, type PreviewDescriptor } from "../../../../packages/contracts/src/jobs";
+import {
+  ImportInput,
+  IngestResult,
+  PipelineArtifact,
+  PipelineClaimInput,
+  CleanupInput,
+  type FailureCode,
+  type PreviewDescriptor,
+} from "../../../../packages/contracts/src/jobs";
 import type { JobType, ProcessingState } from "../../../../packages/contracts/src/states";
 
 import { assertJobTransition } from "../domain/job-state-machine";
@@ -26,6 +34,7 @@ interface ClaimedJobRow extends Record<string, unknown> {
   script_version: number | null;
   source_asset_id: string | null;
   status: ProcessingState;
+  target_job_id: string | null;
   version: number;
 }
 
@@ -38,6 +47,7 @@ export interface ClaimLeaseInput {
 }
 
 export interface ClaimedLease {
+  cleanupInput?: CleanupInput;
   importInput?: ImportInput;
   ingestResult?: IngestResult;
   jobId: string;
@@ -77,9 +87,26 @@ export interface CompleteLeaseInput {
   nextState: ProcessingState;
   nowUtc: string;
   step: string;
+  failureCode?: FailureCode;
   ingestResult?: IngestResult;
   pipelineArtifacts?: readonly PipelineArtifact[];
   preview?: PreviewDescriptor;
+}
+
+/** Automated claims allowed per step before the job needs an administrator (spec section 14). */
+export const MAX_STEP_ATTEMPTS = 5;
+const RETENTION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function plusRetentionWindow(nowUtc: string): string {
+  return new Date(new Date(nowUtc).getTime() + RETENTION_WINDOW_MS).toISOString();
+}
+
+function allowsGoogleProcessing(rightsMetadataJson: string | null | undefined): boolean {
+  if (!rightsMetadataJson) return false;
+  const metadata: unknown = JSON.parse(rightsMetadataJson);
+  const processors =
+    typeof metadata === "object" && metadata !== null ? (metadata as { allowedProcessors?: unknown }).allowedProcessors : undefined;
+  return Array.isArray(processors) && processors.includes("GOOGLE_GEMINI");
 }
 
 export class LeaseInvalidError extends Error {
@@ -152,13 +179,8 @@ function latestArtifact(artifacts: readonly PipelineArtifact[], kind: PipelineAr
 }
 
 function googleProcessingAllowed(row: ClaimedJobRow): true {
-  if (!row.rights_metadata_json) throw new Error("Translation claim is missing its rights policy.");
-  const metadata: unknown = JSON.parse(row.rights_metadata_json);
-  const processors =
-    typeof metadata === "object" && metadata !== null
-      ? (metadata as { allowedProcessors?: unknown }).allowedProcessors
-      : undefined;
-  if (!Array.isArray(processors) || !processors.includes("GOOGLE_GEMINI")) {
+  // The claim query already excludes TRANSLATING rows without consent; this is a defensive re-check.
+  if (!allowsGoogleProcessing(row.rights_metadata_json)) {
     throw new Error("Translation rights do not permit Google Gemini processing.");
   }
   return true;
@@ -244,7 +266,7 @@ export class LeaseService {
     const statePlaceholders = input.supportedStates.map(() => "?").join(", ");
     const claimed = await this.database
       .prepare(
-        `WITH candidate AS (SELECT jobs.id, jobs.version FROM jobs LEFT JOIN source_assets AS source_asset ON source_asset.id = jobs.source_asset_id WHERE jobs.status IN (${statePlaceholders}) AND jobs.available_at <= ? AND (jobs.lease_until IS NULL OR jobs.lease_until <= ?) AND jobs.job_type IN (${jobTypePlaceholders}) AND (jobs.job_type <> 'IMPORT' OR (source_asset.id IS NOT NULL AND source_asset.rights_revoked_at IS NULL)) ORDER BY jobs.priority DESC, jobs.created_at ASC LIMIT 1) UPDATE jobs SET lease_owner = ?, lease_token_hash = ?, lease_until = ?, attempt_count = attempt_count + 1, version = version + 1, updated_at = ? WHERE id = (SELECT id FROM candidate) AND version = (SELECT version FROM candidate) AND (lease_until IS NULL OR lease_until <= ?) RETURNING id, job_type, status, version, lease_until, source_asset_id, ingest_result_json, pipeline_lineage_json, (SELECT metadata_json FROM source_assets WHERE id = source_asset_id) AS metadata_json, (SELECT rights_metadata_json FROM source_assets WHERE id = source_asset_id) AS rights_metadata_json, (SELECT content_hash FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_hash, (SELECT version FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_version`,
+        `WITH candidate AS (SELECT jobs.id, jobs.version FROM jobs LEFT JOIN source_assets AS source_asset ON source_asset.id = jobs.source_asset_id WHERE jobs.status IN (${statePlaceholders}) AND jobs.available_at <= ? AND (jobs.lease_until IS NULL OR jobs.lease_until <= ?) AND jobs.job_type IN (${jobTypePlaceholders}) AND jobs.attempt_count < ${MAX_STEP_ATTEMPTS} AND (jobs.job_type = 'DELETE_EXPIRED' OR (source_asset.id IS NOT NULL AND source_asset.rights_revoked_at IS NULL)) AND (jobs.job_type <> 'DELETE_EXPIRED' OR EXISTS (SELECT 1 FROM jobs AS target WHERE target.id = jobs.target_job_id AND target.status IN ('FAILED', 'EXPIRED', 'RIGHTS_BLOCKED', 'CANCELLED'))) AND (jobs.status <> 'TRANSLATING' OR EXISTS (SELECT 1 FROM json_each(source_asset.rights_metadata_json, '$.allowedProcessors') AS processor WHERE processor.value = 'GOOGLE_GEMINI')) ORDER BY jobs.priority DESC, jobs.created_at ASC LIMIT 1) UPDATE jobs SET lease_owner = ?, lease_token_hash = ?, lease_until = ?, attempt_count = attempt_count + 1, version = version + 1, updated_at = ? WHERE id = (SELECT id FROM candidate) AND version = (SELECT version FROM candidate) AND (lease_until IS NULL OR lease_until <= ?) RETURNING id, job_type, status, version, lease_until, source_asset_id, target_job_id, ingest_result_json, pipeline_lineage_json, (SELECT metadata_json FROM source_assets WHERE id = source_asset_id) AS metadata_json, (SELECT rights_metadata_json FROM source_assets WHERE id = source_asset_id) AS rights_metadata_json, (SELECT content_hash FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_hash, (SELECT version FROM script_versions WHERE job_id = jobs.id ORDER BY version DESC LIMIT 1) AS script_version`,
       )
       .bind(
         ...input.supportedStates,
@@ -269,6 +291,10 @@ export class LeaseService {
     };
     if (["EXTRACTING_AUDIO", "TRANSCRIBING", "TRANSLATING", "GENERATING_VOICE", "MIXING", "RENDERING", "READY_FOR_PREVIEW"].includes(claimed.status)) {
       return { ...lease, pipelineInput: pipelineInputFromClaim(claimed) };
+    }
+    if (claimed.job_type === "DELETE_EXPIRED") {
+      if (!claimed.target_job_id) throw new Error("Cleanup job is missing its target job.");
+      return { ...lease, cleanupInput: CleanupInput.parse({ targetJobId: claimed.target_job_id }) };
     }
     if (claimed.job_type !== "IMPORT") return lease;
     if (claimed.status === "QUEUED" || claimed.status === "INGESTING") {
@@ -307,7 +333,12 @@ export class LeaseService {
   }
 
   async complete(input: CompleteLeaseInput): Promise<void> {
-    assertJobTransition(input.expectedState, input.nextState);
+    // Cleanup commands are the only jobs that finish straight from QUEUED; the UPDATE enforces the job type.
+    const isCleanupCompletion = input.expectedState === "QUEUED" && input.nextState === "COMPLETED";
+    if (!isCleanupCompletion) assertJobTransition(input.expectedState, input.nextState);
+    if (input.failureCode && input.nextState !== "FAILED" && input.nextState !== "MANUAL_REVIEW_REQUIRED") {
+      throw new Error("Failure codes may only accompany a FAILED or MANUAL_REVIEW_REQUIRED completion.");
+    }
     if (input.ingestResult && (input.expectedState !== "INGESTING" || input.nextState !== "PROBING")) {
       throw new Error("Ingest metadata may only be recorded when an import advances from INGESTING to PROBING.");
     }
@@ -324,7 +355,31 @@ export class LeaseService {
         throw new Error("Preview descriptors require the canonical transition and a maximum five-minute lifetime.");
       }
     }
+    let nextState = input.nextState;
+    let step = input.step;
+    if (input.expectedState === "TRANSCRIBING" && input.nextState === "TRANSLATING") {
+      const rights = await this.database
+        .prepare(
+          "SELECT source_asset.rights_metadata_json FROM jobs JOIN source_assets AS source_asset ON source_asset.id = jobs.source_asset_id WHERE jobs.id = ?",
+        )
+        .bind(input.jobId)
+        .first<{ rights_metadata_json: string | null }>();
+      // Without recorded consent the job stops for manual translation (spec section 6); it never reaches Gemini.
+      if (!allowsGoogleProcessing(rights?.rights_metadata_json)) {
+        nextState = "MANUAL_REVIEW_REQUIRED";
+        step = "TRANSLATION_CONSENT_MISSING";
+      }
+    }
+    const scriptArtifact =
+      input.expectedState === "TRANSLATING" && nextState === "WAITING_SCRIPT_REVIEW"
+        ? input.pipelineArtifacts?.find((artifact) => artifact.kind === "SCRIPT")
+        : undefined;
+    if (input.expectedState === "TRANSLATING" && nextState === "WAITING_SCRIPT_REVIEW" && !scriptArtifact) {
+      throw new Error("A translated script requires its SCRIPT artifact.");
+    }
+    const retentionDeadline = nextState === "READY_FOR_PREVIEW" || nextState === "FAILED" ? plusRetentionWindow(input.nowUtc) : null;
     const detailsJson = JSON.stringify({
+      ...(input.failureCode ? { failureCode: input.failureCode } : {}),
       ...(input.ingestResult ? { normalizedHash: input.ingestResult.normalizedHash } : {}),
       ...(input.pipelineArtifacts
         ? {
@@ -333,18 +388,20 @@ export class LeaseService {
         : {}),
       ...(input.preview ? { previewExpiresAtUtc: input.preview.expiresAtUtc, renderSha256: input.preview.renderSha256 } : {}),
     });
-    const results = await this.database.batch([
+    const completedJobExists = "EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = ? AND version = ? AND lease_owner IS NULL)";
+    const statements = [
       this.database
         .prepare(
-          "UPDATE jobs SET status = ?, step = ?, ingest_result_json = COALESCE(?, ingest_result_json), pipeline_lineage_json = CASE WHEN ? IS NULL THEN pipeline_lineage_json ELSE json_insert(COALESCE(pipeline_lineage_json, '[]'), '$[#]', json(?)) END, preview_descriptor_json = COALESCE(?, preview_descriptor_json), lease_owner = NULL, lease_token_hash = NULL, lease_until = NULL, version = version + 1, updated_at = ? WHERE id = ? AND lease_owner = ? AND lease_token_hash = ? AND lease_until > ? AND status = ? AND version = ? AND (? IS NULL OR job_type = 'IMPORT') AND (? IS NULL OR EXISTS (SELECT 1 FROM json_tree(jobs.pipeline_lineage_json) AS artifact WHERE artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'RENDER' AND json_extract(artifact.value, '$.sha256') = ?))",
+          "UPDATE jobs SET status = ?, step = ?, ingest_result_json = COALESCE(?, ingest_result_json), pipeline_lineage_json = CASE WHEN ? IS NULL THEN pipeline_lineage_json ELSE json_insert(COALESCE(pipeline_lineage_json, '[]'), '$[#]', json(?)) END, preview_descriptor_json = COALESCE(?, preview_descriptor_json), retention_deadline = COALESCE(?, retention_deadline), attempt_count = 0, lease_owner = NULL, lease_token_hash = NULL, lease_until = NULL, version = version + 1, updated_at = ? WHERE id = ? AND lease_owner = ? AND lease_token_hash = ? AND lease_until > ? AND status = ? AND version = ? AND (job_type = 'DELETE_EXPIRED') = ? AND (? IS NULL OR job_type = 'IMPORT') AND (? IS NULL OR EXISTS (SELECT 1 FROM json_tree(jobs.pipeline_lineage_json) AS artifact WHERE artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'RENDER' AND json_extract(artifact.value, '$.sha256') = ?))",
         )
         .bind(
-          input.nextState,
-          input.step,
+          nextState,
+          step,
           ingestResultJson,
           pipelineArtifactsJson,
           pipelineArtifactsJson,
           previewJson,
+          retentionDeadline,
           input.nowUtc,
           input.jobId,
           input.agentId,
@@ -352,29 +409,30 @@ export class LeaseService {
           input.nowUtc,
           input.expectedState,
           input.jobVersion,
+          isCleanupCompletion ? 1 : 0,
           ingestResultJson,
           input.preview?.renderSha256 ?? null,
           input.preview?.renderSha256 ?? null,
         ),
       this.database
         .prepare(
-          "INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = ? AND version = ? AND lease_owner IS NULL)",
+          `INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${completedJobExists}`,
         )
         .bind(
           this.newId(),
           input.jobId,
           "STEP_COMPLETED",
           input.expectedState,
-          input.nextState,
+          nextState,
           detailsJson,
           input.nowUtc,
           input.jobId,
-          input.nextState,
+          nextState,
           input.jobVersion + 1,
         ),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = ? AND version = ? AND lease_owner IS NULL)",
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${completedJobExists}`,
         )
         .bind(
           this.newId(),
@@ -387,39 +445,37 @@ export class LeaseService {
           null,
           this.newId(),
           input.expectedState,
-          input.nextState,
+          nextState,
           detailsJson,
           input.nowUtc,
           input.jobId,
-          input.nextState,
-          input.jobVersion + 1,
-        ),
-      ...this.scriptVersionStatements(input),
-    ]);
-    if (results[0]?.meta?.changes !== 1) throw new LeaseInvalidError();
-  }
-
-  /** A translated script becomes the next reviewable script version once its completion is accepted. */
-  private scriptVersionStatements(input: CompleteLeaseInput): LeaseStatement[] {
-    const script = input.pipelineArtifacts?.find((artifact) => artifact.kind === "SCRIPT");
-    if (input.nextState !== "WAITING_SCRIPT_REVIEW" || !script) return [];
-    return [
-      this.database
-        .prepare(
-          "INSERT INTO script_versions (id, job_id, version, content_hash, transcript_hash, translation_hash, metadata_hash, voice_settings_hash, created_at) SELECT ?, ?, COALESCE((SELECT MAX(version) FROM script_versions WHERE job_id = ?), 0) + 1, ?, (SELECT json_extract(artifact.value, '$.sha256') FROM jobs, json_tree(jobs.pipeline_lineage_json) AS artifact WHERE jobs.id = ? AND artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'TRANSCRIPT' ORDER BY artifact.id DESC LIMIT 1), ?, NULL, NULL, ? WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = ? AND version = ? AND lease_owner IS NULL)",
-        )
-        .bind(
-          this.newId(),
-          input.jobId,
-          input.jobId,
-          script.sha256,
-          input.jobId,
-          script.sha256,
-          input.nowUtc,
-          input.jobId,
-          input.nextState,
+          nextState,
           input.jobVersion + 1,
         ),
     ];
+    if (scriptArtifact) {
+      // The agent's translated script becomes the reviewable script version; its hash is computed by the agent
+      // from the artifact bytes, never supplied by the browser.
+      statements.push(
+        this.database
+          .prepare(
+            `INSERT INTO script_versions (id, job_id, version, content_hash, transcript_hash, translation_hash, metadata_hash, voice_settings_hash, created_at) SELECT ?, ?, (SELECT COALESCE(MAX(version), 0) + 1 FROM script_versions WHERE job_id = ?), ?, (SELECT json_extract(artifact.value, '$.sha256') FROM jobs, json_tree(jobs.pipeline_lineage_json) AS artifact WHERE jobs.id = ? AND artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'TRANSCRIPT' ORDER BY artifact.id DESC LIMIT 1), ?, NULL, NULL, ? WHERE ${completedJobExists}`,
+          )
+          .bind(
+            this.newId(),
+            input.jobId,
+            input.jobId,
+            scriptArtifact.sha256,
+            input.jobId,
+            scriptArtifact.sha256,
+            input.nowUtc,
+            input.jobId,
+            nextState,
+            input.jobVersion + 1,
+          ),
+      );
+    }
+    const results = await this.database.batch(statements);
+    if (results[0]?.meta?.changes !== 1) throw new LeaseInvalidError();
   }
 }

@@ -1,9 +1,9 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
-const migrationsDirectory = fileURLToPath(new URL("../db/migrations/", import.meta.url));
+const migrationsDirectory = resolve(fileURLToPath(new URL("../", import.meta.url)), "db/migrations");
 
 function sqliteInputValues(values: unknown[]): Array<bigint | null | number | string> {
   return values.map((value) => {
@@ -33,12 +33,23 @@ export class SqliteStatement {
     return (this.database.prepare(this.sql).get(...sqliteInputValues(this.values)) as Row | undefined) ?? null;
   }
 
-  async run<Row extends Record<string, unknown>>(): Promise<{ meta: { changes: number }; results: Row[] }> {
+  async run<Row extends Record<string, unknown> = Record<string, unknown>>(): Promise<{ meta: { changes: number }; results: Row[] }> {
+    const statement = this.database.prepare(this.sql);
+    if (/\bRETURNING\b/i.test(this.sql)) {
+      const results = statement.all(...sqliteInputValues(this.values)) as Row[];
+      return { meta: { changes: results.length }, results };
+    }
+    const result = statement.run(...sqliteInputValues(this.values));
+    return { meta: { changes: Number(result.changes) }, results: [] };
+  }
+
+  runSync(): { meta: { changes: number }; results: Record<string, unknown>[] } {
     const result = this.database.prepare(this.sql).run(...sqliteInputValues(this.values));
     return { meta: { changes: Number(result.changes) }, results: [] };
   }
 }
 
+/** D1-compatible adapter: `batch` runs its statements sequentially in one transaction, like D1. */
 export class SqliteD1 {
   constructor(readonly sqlite: DatabaseSync) {}
 
@@ -49,7 +60,7 @@ export class SqliteD1 {
   async batch(statements: SqliteStatement[]): Promise<Array<{ meta: { changes: number }; results: Record<string, unknown>[] }>> {
     this.sqlite.exec("BEGIN");
     try {
-      const results = await Promise.all(statements.map((statement) => statement.run()));
+      const results = statements.map((statement) => statement.runSync());
       this.sqlite.exec("COMMIT");
       return results;
     } catch (error) {
@@ -57,11 +68,21 @@ export class SqliteD1 {
       throw error;
     }
   }
+
+  close(): void {
+    this.sqlite.close();
+  }
 }
 
+const allMigrations = (): string[] => readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
+
 /** In-memory SQLite database with the given migrations (all of them by default) applied. */
-export function createSqliteD1(migrations: readonly string[] = readdirSync(migrationsDirectory).filter((name) => name.endsWith(".sql")).sort()): SqliteD1 {
+export function createSqliteD1(migrations: readonly string[] = allMigrations()): SqliteD1 {
   const database = new DatabaseSync(":memory:");
-  for (const migration of migrations) database.exec(readFileSync(resolve(migrationsDirectory, migration), "utf8"));
+  for (const file of migrations) database.exec(readFileSync(resolve(migrationsDirectory, file), "utf8"));
   return new SqliteD1(database);
+}
+
+export function createMigratedD1(): SqliteD1 {
+  return createSqliteD1();
 }

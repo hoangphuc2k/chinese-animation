@@ -278,6 +278,10 @@ describe("processing-agent authentication", () => {
   it.each([
     ["a different service token", serviceTokenClaims("other-client.access")],
     ["a user identity token", { aud: ["processing-agent-audience"], sub: "user-admin-1" }],
+    [
+      "a user identity token carrying the configured common_name",
+      { ...serviceTokenClaims("agent-client-1.access"), sub: "user-admin-1" },
+    ],
   ])("rejects %s", async (_name, claims) => {
     const { app, fixture } = await agentApp();
 

@@ -84,6 +84,19 @@ class JobWorkspaceManager:
             raise ValueError("Workspace manifest does not match the requested job.")
         return workspace
 
+    def remove(self, job_id: str) -> bool:
+        """Delete one job's workspace. Returns False when it is already gone; refuses symlinks."""
+        safe_job_id = _uuid(job_id)
+        root = self._root / safe_job_id
+        if root.is_symlink():
+            raise ValueError("Workspace path is a symlink; refusing to delete through it.")
+        if not root.exists():
+            return False
+        if not root.is_dir() or root.resolve().parent != self._root.resolve():
+            raise ValueError("Workspace path escaped the configured root.")
+        shutil.rmtree(root)
+        return True
+
     def update(self, workspace: JobWorkspace, *, stage: str, **values: object) -> JobManifest:
         current = self.load(workspace)
         manifest = current.model_copy(update={"stage": stage, **values})

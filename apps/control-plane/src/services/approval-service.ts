@@ -1,5 +1,5 @@
 import type { SqlDatabase } from "../repositories/sql";
-import type { WorkflowDatabase } from "./job-service";
+import { StaleWorkflowError, type WorkflowDatabase } from "./job-service";
 
 type ApprovalDatabase = SqlDatabase & WorkflowDatabase;
 
@@ -48,14 +48,13 @@ export interface ApprovePublishInput {
   scheduleAtUtc: string | null;
 }
 
-interface VersionRow extends Record<string, unknown> {
-  content_hash: string;
-  version: number;
-}
-
-interface JobStateRow extends Record<string, unknown> {
+interface ScriptApprovalTargetRow extends Record<string, unknown> {
+  content_hash: string | null;
+  script_artifact_hash: string | null;
+  job_version: number;
+  lease_until: string | null;
   status: string;
-  version: number;
+  version: number | null;
 }
 
 interface NextVersionRow extends Record<string, unknown> {
@@ -73,6 +72,15 @@ export class ApprovalMismatchError extends Error {
     super("The requested version and hash do not match a current immutable record.");
   }
 }
+
+export class DestinationInFlightError extends Error {
+  constructor() {
+    super("A requested destination is already uploading, staged, or published and cannot be re-approved.");
+  }
+}
+
+/** Destination states from which a fresh publish approval may (re)start the upload. */
+const reapprovableDestinationStates = ["NOT_REQUESTED", "READY_TO_UPLOAD", "FAILED"] as const;
 
 export class ApprovalService {
   constructor(
@@ -131,52 +139,61 @@ export class ApprovalService {
   }
 
   async approveScript(input: ApproveScriptInput): Promise<string> {
-    const script = await this.database
-      .prepare("SELECT version, content_hash FROM script_versions WHERE job_id = ? AND version = ?")
-      .bind(input.jobId, input.scriptVersion)
-      .first<VersionRow>();
-    if (!script || script.content_hash !== input.contentHash) throw new ApprovalMismatchError();
-    const latest = await this.database
-      .prepare("SELECT MAX(version) AS version FROM script_versions WHERE job_id = ?")
+    const target = await this.database
+      .prepare(
+        "SELECT jobs.status, jobs.version AS job_version, jobs.lease_until, latest.version, latest.content_hash, (SELECT json_extract(artifact.value, '$.sha256') FROM json_tree(jobs.pipeline_lineage_json) AS artifact WHERE artifact.type = 'object' AND json_extract(artifact.value, '$.kind') = 'SCRIPT' ORDER BY artifact.id DESC LIMIT 1) AS script_artifact_hash FROM jobs LEFT JOIN script_versions AS latest ON latest.job_id = jobs.id AND latest.version = (SELECT MAX(version) FROM script_versions WHERE job_id = jobs.id) WHERE jobs.id = ?",
+      )
       .bind(input.jobId)
-      .first<NextVersionRow>();
-    if (latest?.version !== input.scriptVersion) throw new ApprovalMismatchError();
-    const job = await this.database
-      .prepare("SELECT status, version FROM jobs WHERE id = ?")
-      .bind(input.jobId)
-      .first<JobStateRow>();
+      .first<ScriptApprovalTargetRow>();
+    // Only the latest version, shown while the job waits for review, can be approved.
+    if (
+      !target ||
+      target.status !== "WAITING_SCRIPT_REVIEW" ||
+      (target.lease_until !== null && target.lease_until > input.nowUtc) ||
+      target.version !== input.scriptVersion ||
+      target.content_hash !== input.contentHash ||
+      // Voice generation synthesizes the agent's SCRIPT artifact. Until edited script content is stored
+      // and handed to the agent, only a version identical to that artifact can be approved.
+      target.script_artifact_hash !== input.contentHash
+    ) {
+      throw new ApprovalMismatchError();
+    }
     const approvalId = this.newId();
-    // Approving the latest script releases a job waiting for review to voice generation.
-    const advance =
-      job?.status === "WAITING_SCRIPT_REVIEW"
-        ? [
-            this.database
-              .prepare(
-                "UPDATE jobs SET status = 'GENERATING_VOICE', step = 'GENERATING_VOICE', version = version + 1, available_at = ?, updated_at = ? WHERE id = ? AND status = 'WAITING_SCRIPT_REVIEW' AND version = ?",
-              )
-              .bind(input.nowUtc, input.nowUtc, input.jobId, job.version),
-            this.database
-              .prepare(
-                "INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, id, 'SCRIPT_APPROVED', 'WAITING_SCRIPT_REVIEW', 'GENERATING_VOICE', '{}', ? FROM jobs WHERE id = ? AND status = 'GENERATING_VOICE' AND version = ?",
-              )
-              .bind(this.newId(), input.nowUtc, input.jobId, job.version + 1),
-          ]
-        : [];
-    await this.database.batch([
-      ...advance,
+    const advancedJob = "EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'GENERATING_VOICE' AND version = ?)";
+    const results = await this.database.batch([
       this.database
         .prepare(
-          "UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL",
+          "UPDATE jobs SET status = 'GENERATING_VOICE', step = 'GENERATING_VOICE', available_at = ?, attempt_count = 0, version = version + 1, updated_at = ? WHERE id = ? AND status = 'WAITING_SCRIPT_REVIEW' AND version = ?",
         )
-        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "SCRIPT_APPROVED"),
+        .bind(input.nowUtc, input.nowUtc, input.jobId, target.job_version),
       this.database
         .prepare(
-          "INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL)",
+          `INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, 'SCRIPT_APPROVED', 'WAITING_SCRIPT_REVIEW', 'GENERATING_VOICE', '{}', ? WHERE ${advancedJob}`,
         )
-        .bind(approvalId, input.jobId, "SCRIPT_APPROVED", input.scriptVersion, input.contentHash, input.actorId, input.nowUtc),
+        .bind(this.newId(), input.jobId, input.nowUtc, input.jobId, target.job_version + 1),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL AND ${advancedJob}`,
+        )
+        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "SCRIPT_APPROVED", input.jobId, target.job_version + 1),
+      this.database
+        .prepare(
+          `INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) SELECT ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, NULL WHERE ${advancedJob}`,
+        )
+        .bind(
+          approvalId,
+          input.jobId,
+          "SCRIPT_APPROVED",
+          input.scriptVersion,
+          input.contentHash,
+          input.actorId,
+          input.nowUtc,
+          input.jobId,
+          target.job_version + 1,
+        ),
+      this.database
+        .prepare(
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${advancedJob}`,
         )
         .bind(
           this.newId(),
@@ -188,12 +205,15 @@ export class ApprovalService {
           input.scriptVersion,
           input.contentHash,
           input.requestId,
-          null,
-          null,
+          "WAITING_SCRIPT_REVIEW",
+          "GENERATING_VOICE",
           "{}",
           input.nowUtc,
+          input.jobId,
+          target.job_version + 1,
         ),
     ]);
+    if (results[0]?.meta?.changes !== 1) throw new StaleWorkflowError();
     return approvalId;
   }
 
@@ -243,16 +263,27 @@ export class ApprovalService {
       .bind(input.renderId, input.jobId, input.renderVersion)
       .first<RenderVersionRow>();
     if (!render) throw new ApprovalMismatchError();
+    const job = await this.database.prepare("SELECT status FROM jobs WHERE id = ?").bind(input.jobId).first<{ status: string }>();
+    if (job?.status !== "WAITING_PUBLISH_APPROVAL") throw new ApprovalMismatchError();
+    // A new approval supersedes the job's active one, so no destination of this job may be mid-upload,
+    // staged or published, not just the requested ones. The same guard is re-evaluated inside the batch.
+    const noDestinationInFlight = `NOT EXISTS (SELECT 1 FROM destination_publications WHERE job_id = ? AND status NOT IN (${reapprovableDestinationStates.map(() => "?").join(", ")}))`;
+    const noDestinationInFlightValues = [input.jobId, ...reapprovableDestinationStates];
+    const inFlight = await this.database
+      .prepare(`SELECT 1 AS in_flight WHERE NOT ${noDestinationInFlight}`)
+      .bind(...noDestinationInFlightValues)
+      .first<{ in_flight: number }>();
+    if (inFlight) throw new DestinationInFlightError();
     const approvalId = this.newId();
     const statements = [
       this.database
         .prepare(
-          "UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL",
+          `UPDATE approvals SET invalidated_at = ?, invalidation_reason = ? WHERE job_id = ? AND approval_type = ? AND invalidated_at IS NULL AND ${noDestinationInFlight}`,
         )
-        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "PUBLISH_APPROVED"),
+        .bind(input.nowUtc, "SUPERSEDED", input.jobId, "PUBLISH_APPROVED", ...noDestinationInFlightValues),
       this.database
         .prepare(
-          "INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+          `INSERT INTO approvals (id, job_id, approval_type, version, content_hash, metadata_hash, destinations_json, schedule_at_utc, actor_id, approved_at, invalidated_at, invalidation_reason) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL WHERE ${noDestinationInFlight}`,
         )
         .bind(
           approvalId,
@@ -265,11 +296,12 @@ export class ApprovalService {
           input.scheduleAtUtc,
           input.actorId,
           input.nowUtc,
+          ...noDestinationInFlightValues,
         ),
       ...input.destinations.map((destination) =>
         this.database
           .prepare(
-            "INSERT INTO destination_publications (id, job_id, destination, provider_asset_id, provider_session_id, render_version_id, status, metadata_hash, scheduled_at_utc, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, destination) DO UPDATE SET render_version_id = excluded.render_version_id, status = excluded.status, metadata_hash = excluded.metadata_hash, scheduled_at_utc = excluded.scheduled_at_utc, updated_at = excluded.updated_at",
+            `INSERT INTO destination_publications (id, job_id, destination, provider_asset_id, provider_session_id, render_version_id, status, metadata_hash, scheduled_at_utc, created_at, updated_at) SELECT ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ? WHERE ${noDestinationInFlight} ON CONFLICT(job_id, destination) DO UPDATE SET render_version_id = excluded.render_version_id, status = excluded.status, metadata_hash = excluded.metadata_hash, scheduled_at_utc = excluded.scheduled_at_utc, updated_at = excluded.updated_at WHERE destination_publications.status IN ('NOT_REQUESTED', 'READY_TO_UPLOAD', 'FAILED')`,
           )
           .bind(
             this.newId(),
@@ -281,11 +313,12 @@ export class ApprovalService {
             input.scheduleAtUtc,
             input.nowUtc,
             input.nowUtc,
+            ...noDestinationInFlightValues,
           ),
       ),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${noDestinationInFlight}`,
         )
         .bind(
           this.newId(),
@@ -301,9 +334,11 @@ export class ApprovalService {
           null,
           JSON.stringify({ destinations: input.destinations, metadataHash: input.metadataHash }),
           input.nowUtc,
+          ...noDestinationInFlightValues,
         ),
     ];
-    await this.database.batch(statements);
+    const results = await this.database.batch(statements);
+    if (results[1]?.meta?.changes !== 1) throw new DestinationInFlightError();
     return { approvalId, renderHash: render.render_hash };
   }
 }

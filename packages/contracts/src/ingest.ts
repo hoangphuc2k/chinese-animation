@@ -11,10 +11,14 @@ const OciLocator = z.object({
 }).strict();
 export const IngestLocator = z.discriminatedUnion("kind", [HttpsLocator, OciLocator]);
 /** Third-party AI processors the rights evidence explicitly allows (spec section 6). */
-export const AllowedProcessor = z.enum(["GOOGLE_GEMINI"]);
+export const AiProcessor = z.enum(["GOOGLE_GEMINI", "AZURE_SPEECH"]);
 export const CreateImportRequest = z
   .object({
-    allowedProcessors: z.array(AllowedProcessor).max(1).default([]),
+    allowedProcessors: z
+      .array(AiProcessor)
+      .max(2)
+      .refine((value) => new Set(value).size === value.length, "allowed processors must be unique")
+      .default([]),
     locator: IngestLocator,
     rightsEvidence: z.string().min(1).max(2000),
   })

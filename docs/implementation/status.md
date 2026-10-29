@@ -20,3 +20,21 @@ Open gaps found by the run:
 - A permanent stage error is retried on every lease expiry (every 5 minutes) instead of moving the job to `MANUAL_REVIEW_REQUIRED`, and the agent logs only the error type.
 - The script API returns hashes only, so the administrator cannot read or edit the transcript and translation.
 - Azure Speech has no rights-record check; only Gemini is gated by `allowedProcessors`.
+
+## Defect fixes after the 2026-10-26 product audit
+
+- Branch: `fix/p0-critical-path`. Source: `claudedocs/2026-10-26-product-audit-report.md`.
+- Fixed and covered by regression tests:
+  - Access auth (no roles claim; agent identified by `common_name`; agent sends service-token headers).
+  - CSRF origin and token endpoint.
+  - Gemini consent at import, with a manual-review stop instead of a claim loop.
+  - Script approval advancing the job; server-created script versions; `GET /jobs/:id`.
+  - Retention deadlines, guarded retention batches, per-target cleanup (migrations 0007–0008) and the agent `DELETE_EXPIRED` handler.
+  - Revocation for every job type, with published destinations flagged.
+  - Safe re-import.
+  - Atomic idempotency.
+  - Publish-approval integrity (server-side metadata hash, future schedule, job state, in-flight destinations).
+  - Per-step attempt cap and deterministic failure reporting.
+  - HTTPS redirect revalidation, pitch-preserving voice tempo, Facebook retry/status bugs, Unicode hashtags.
+- Deployment: Portainer stack in `infra/processing-agent/` and the `agent-image` workflow.
+- Still open: preview delivery (P0-5), publishing wiring (P0-7), OCI Vault secrets. Every PoC gate is still `BLOCKED`; nothing here has run against native D1 or real providers. CI applies migrations 0007–0008 to local D1.

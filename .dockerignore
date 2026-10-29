@@ -1,0 +1,16 @@
+# Build context for infra/local images (context is the repository root).
+# Keep host-built dependencies, caches and media out of Linux images.
+**/node_modules
+.git
+.codegraph
+**/.wrangler
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.egg-info
+artifacts
+infra/local/inbox
+**/*.mp4
+**/*.wav
+.DS_Store
+**/.DS_Store

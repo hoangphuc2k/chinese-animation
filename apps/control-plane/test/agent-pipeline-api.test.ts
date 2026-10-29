@@ -51,4 +51,37 @@ describe("agent pipeline completion route", () => {
       pipelineArtifacts: [{ artifactRef: "artifact-01", kind: "TRANSCRIPT", sha256: hash }],
     });
   });
+  it("forwards a failure code so deterministic agent errors stop instead of crash-looping", async () => {
+    let completed: CompleteLeaseInput | undefined;
+    const routes = createAgentRoutes({
+      authenticate,
+      leaseDurationSeconds: 60,
+      leaseService: {
+        claim: async () => null,
+        complete: async (input: CompleteLeaseInput) => {
+          completed = input;
+        },
+        getScriptApproval: async () => null,
+        heartbeat: async () => undefined,
+      },
+      nowUtc: () => "2026-08-07T00:00:00.000Z",
+      requestId: () => "00000000-0000-4000-8000-000000000099",
+    });
+
+    const response = await routes.request("https://worker.example/jobs/00000000-0000-4000-8000-000000000001/complete", {
+      body: JSON.stringify({
+        expectedState: "MIXING",
+        failureCode: "MEDIA_INVALID",
+        jobVersion: 5,
+        leaseToken: token,
+        state: "MANUAL_REVIEW_REQUIRED",
+        step: "subtitle_rules_failed",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(204);
+    expect(completed).toMatchObject({ failureCode: "MEDIA_INVALID", nextState: "MANUAL_REVIEW_REQUIRED" });
+  });
 });

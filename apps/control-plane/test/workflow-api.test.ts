@@ -1,19 +1,19 @@
-import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createBrowserWorkflowRoutes } from "../src/api/project-routes";
 import { app } from "../src/index";
 import type { AuthContext } from "../src/middleware/access-auth";
-import { createSqliteD1, type SqliteD1 } from "./sqlite-d1";
+import { DestinationMetadata, publishMetadataHash } from "../../../packages/contracts/src/publishing";
+import { createMigratedD1, type SqliteD1 } from "./sqlite-d1";
 import { createTestEnv } from "./worker-harness";
 
 const projectId = "00000000-0000-4000-8000-000000000001";
 const projectIdTwo = "00000000-0000-4000-8000-000000000002";
-const databases: DatabaseSync[] = [];
+const databases: SqliteD1[] = [];
 
 function createDatabase(): SqliteD1 {
-  const database = createSqliteD1(["0001_initial.sql", "0002_workflow_versions_and_request_hashes.sql"]);
-  databases.push(database.sqlite);
+  const database = createMigratedD1();
+  databases.push(database);
   return database;
 }
 
@@ -138,9 +138,10 @@ describe("browser workflow API", () => {
 
     expect(imported.status).toBe(202);
     const importBody = (await imported.json()) as { jobId: string; sourceVideoId: string; state: string };
+    // Idempotency records use internal random IDs, so the import draws the next two domain IDs.
     expect(importBody).toEqual({
-      jobId: "00000000-0000-4000-8000-000000000012",
-      sourceVideoId: "00000000-0000-4000-8000-000000000011",
+      jobId: "00000000-0000-4000-8000-000000000011",
+      sourceVideoId: "00000000-0000-4000-8000-000000000010",
       state: "QUEUED",
     });
 
@@ -227,6 +228,20 @@ describe("browser workflow API", () => {
     expect(firstEdit.status).toBe(201);
     await expect(firstEdit.json()).resolves.toMatchObject({ contentHash: firstHash, jobId, version: 1 });
 
+    const premature = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
+      body: JSON.stringify({ contentHash: firstHash, jobId, scriptVersion: 1 }),
+      headers: { "content-type": "application/json", "idempotency-key": "approve-script-early" },
+      method: "POST",
+    });
+    expect(premature.status).toBe(409);
+
+    // The agent's translated SCRIPT artifact is what voice generation will synthesize; approval must match it.
+    const lineage = JSON.stringify([
+      [{ artifactRef: "script-01.json", byteCount: 10, kind: "SCRIPT", sha256: firstHash, toolVersion: "gemini-test" }],
+    ]);
+    database.sqlite
+      .prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', pipeline_lineage_json = ? WHERE id = ?")
+      .run(lineage, jobId);
     const approved = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
       body: JSON.stringify({ contentHash: firstHash, jobId, scriptVersion: 1 }),
       headers: { "content-type": "application/json", "idempotency-key": "approve-script-1" },
@@ -234,6 +249,7 @@ describe("browser workflow API", () => {
     });
     expect(approved.status).toBe(202);
     await expect(approved.json()).resolves.toMatchObject({ contentHash: firstHash, jobId, scriptVersion: 1 });
+    expect(database.sqlite.prepare("SELECT status FROM jobs WHERE id = ?").get(jobId)).toEqual({ status: "GENERATING_VOICE" });
 
     const secondEdit = await operator.request(`https://control.example.test/jobs/${jobId}/scripts`, {
       body: JSON.stringify({ contentHash: secondHash, transcriptHash: "d".repeat(64) }),
@@ -287,7 +303,13 @@ describe("browser workflow API", () => {
         method: "POST",
       });
     }
-    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', step = 'WAITING_SCRIPT_REVIEW' WHERE id = ?").run(jobId);
+    // Voice generation synthesizes the agent's SCRIPT artifact, so the approved version must match it.
+    const lineage = JSON.stringify([
+      [{ artifactRef: "script-02.json", byteCount: 10, kind: "SCRIPT", sha256: "b".repeat(64), toolVersion: "gemini-test" }],
+    ]);
+    database.sqlite
+      .prepare("UPDATE jobs SET status = 'WAITING_SCRIPT_REVIEW', step = 'WAITING_SCRIPT_REVIEW', pipeline_lineage_json = ? WHERE id = ?")
+      .run(lineage, jobId);
     const versionBefore = (database.sqlite.prepare("SELECT version FROM jobs WHERE id = ?").get(jobId) as { version: number }).version;
 
     const superseded = await reviewer.request(`https://control.example.test/jobs/${jobId}/scripts/approve`, {
@@ -351,7 +373,10 @@ describe("browser workflow API", () => {
     });
     const { jobId } = (await imported.json()) as { jobId: string };
     const firstRenderHash = "e".repeat(64);
-    const metadataHash = "f".repeat(64);
+    const youtubeMetadata = [
+      { description: "Vietnamese description", destination: "YOUTUBE", tags: ["anime"], title: "Vietnamese title" },
+    ] as const;
+    const metadataHash = await publishMetadataHash(youtubeMetadata.map((entry) => DestinationMetadata.parse(entry)));
 
     const firstRender = await operator.request(`https://control.example.test/jobs/${jobId}/renders`, {
       body: JSON.stringify({ byteCount: 42, previewDescriptor: "preview-opaque-render-v1", renderHash: firstRenderHash }),
@@ -362,12 +387,13 @@ describe("browser workflow API", () => {
     const firstRenderBody = (await firstRender.json()) as { id: string; preview: { descriptor: string }; version: number };
     expect(firstRenderBody).toMatchObject({ preview: { descriptor: "preview-opaque-render-v1" }, version: 1 });
     expect(JSON.stringify(firstRenderBody)).not.toContain("https://");
+    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_PUBLISH_APPROVAL' WHERE id = ?").run(jobId);
 
     const publishApproved = await reviewer.request(`https://control.example.test/jobs/${jobId}/publish-approval`, {
       body: JSON.stringify({
         destinations: ["YOUTUBE"],
         jobId,
-        metadata: [{ description: "Vietnamese description", destination: "YOUTUBE", tags: ["anime"], title: "Vietnamese title" }],
+        metadata: youtubeMetadata,
         metadataHash,
         renderId: firstRenderBody.id,
         renderVersion: 1,
@@ -398,5 +424,81 @@ describe("browser workflow API", () => {
       .get(jobId) as { content_hash: string; invalidated_at: string | null; metadata_hash: string };
     expect(approval).toMatchObject({ content_hash: firstRenderHash, metadata_hash: metadataHash });
     expect(approval.invalidated_at).toBe("2026-08-04T00:00:00.000Z");
+  });
+  it("rejects publish approvals with a tampered hash, past schedule, wrong state, or a destination already in flight", async () => {
+    const database = createDatabase();
+    const operator = createRoutes(
+      [
+        projectId,
+        "00000000-0000-4000-8000-000000000040",
+        "00000000-0000-4000-8000-000000000041",
+        "00000000-0000-4000-8000-000000000042",
+        "00000000-0000-4000-8000-000000000043",
+        "00000000-0000-4000-8000-000000000044",
+        "00000000-0000-4000-8000-000000000045",
+      ],
+      "operator",
+      database,
+    );
+    const reviewer = createRoutes([], "reviewer", database);
+    await operator.request("https://control.example.test/projects", {
+      body: JSON.stringify({ name: "Guarded publish" }),
+      headers: { "content-type": "application/json", "idempotency-key": "create-guarded-project" },
+      method: "POST",
+    });
+    const imported = await operator.request(`https://control.example.test/projects/${projectId}/imports`, {
+      body: JSON.stringify({ locator: { kind: "OCI_INBOX_FILE", inboxFileId: "episode-3.mp4" }, rightsEvidence: "licence" }),
+      headers: { "content-type": "application/json", "idempotency-key": "import-guarded-job" },
+      method: "POST",
+    });
+    const { jobId } = (await imported.json()) as { jobId: string };
+    const render = await operator.request(`https://control.example.test/jobs/${jobId}/renders`, {
+      body: JSON.stringify({ byteCount: 42, previewDescriptor: "preview-opaque-render-v1", renderHash: "e".repeat(64) }),
+      headers: { "content-type": "application/json", "idempotency-key": "create-guarded-render" },
+      method: "POST",
+    });
+    const renderId = ((await render.json()) as { id: string }).id;
+    const metadata = [{ caption: "Tiểu Vũ", destination: "FACEBOOK", hashtags: ["#hoạthình"] }] as const;
+    const metadataHash = await publishMetadataHash(metadata.map((entry) => DestinationMetadata.parse(entry)));
+    let key = 0;
+    const approve = (overrides: Record<string, unknown>) =>
+      reviewer.request(`https://control.example.test/jobs/${jobId}/publish-approval`, {
+        body: JSON.stringify({
+          destinations: ["FACEBOOK"],
+          jobId,
+          metadata,
+          metadataHash,
+          renderId,
+          renderVersion: 1,
+          scheduleAtUtc: null,
+          ...overrides,
+        }),
+        headers: { "content-type": "application/json", "idempotency-key": `guarded-approval-${(key += 1)}` },
+        method: "POST",
+      });
+
+    expect((await approve({})).status).toBe(409);
+
+    database.sqlite.prepare("UPDATE jobs SET status = 'WAITING_PUBLISH_APPROVAL' WHERE id = ?").run(jobId);
+    expect((await approve({ metadataHash: "f".repeat(64) })).status).toBe(400);
+    expect((await approve({ scheduleAtUtc: "2026-08-03T23:00:00Z" })).status).toBe(400);
+
+    database.sqlite
+      .prepare(
+        "INSERT INTO destination_publications (id, job_id, destination, status, metadata_hash, created_at, updated_at) VALUES ('publication-fb', ?, 'FACEBOOK', 'UPLOADING', 'old', '2026-08-04T00:00:00Z', '2026-08-04T00:00:00Z')",
+      )
+      .run(jobId);
+    expect((await approve({})).status).toBe(409);
+    expect(database.sqlite.prepare("SELECT status, metadata_hash FROM destination_publications").get()).toEqual({
+      metadata_hash: "old",
+      status: "UPLOADING",
+    });
+
+    database.sqlite.prepare("UPDATE destination_publications SET status = 'FAILED'").run();
+    expect((await approve({ scheduleAtUtc: "2026-08-05T01:00:00Z" })).status).toBe(202);
+    expect(database.sqlite.prepare("SELECT status, metadata_hash FROM destination_publications").get()).toEqual({
+      metadata_hash: metadataHash,
+      status: "READY_TO_UPLOAD",
+    });
   });
 });

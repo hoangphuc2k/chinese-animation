@@ -122,6 +122,7 @@ export function createAgentRoutes(options: AgentRoutesOptions): Hono<{ Variables
         nowUtc: nowUtc(),
         step: input.data.step,
       };
+      if (input.data.failureCode) completion.failureCode = input.data.failureCode;
       if (input.data.ingestResult) completion.ingestResult = input.data.ingestResult;
       if (input.data.pipelineArtifacts) completion.pipelineArtifacts = input.data.pipelineArtifacts;
       if (input.data.preview) completion.preview = input.data.preview;

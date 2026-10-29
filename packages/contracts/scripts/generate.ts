@@ -19,6 +19,13 @@ const openapi = {
   } },
 };
 const agentSchemas = {
+  CleanupInput: {
+    type: "object",
+    required: ["targetJobId"],
+    properties: { targetJobId: { type: "string", format: "uuid" } },
+    additionalProperties: false,
+  },
+  FailureCode: { type: "string", enum: ["RETRYABLE_NETWORK", "RATE_LIMITED", "AUTH_REQUIRED", "RIGHTS_BLOCKED", "QUOTA_EXHAUSTED", "INVALID_AI_RESPONSE", "MEDIA_INVALID", "DISK_PRESSURE", "MANUAL_REVIEW_REQUIRED"] },
   ClaimJobRequest: {
     type: "object",
     required: ["supportedJobTypes", "supportedStates"],
@@ -141,6 +148,7 @@ const agentSchemas = {
     type: "object",
     required: ["jobId", "jobType", "jobVersion", "state", "leaseToken", "leaseExpiresAtUtc", "requestId"],
     properties: {
+      cleanupInput: { $ref: "#/components/schemas/CleanupInput" },
       importInput: { $ref: "#/components/schemas/ImportInput" },
       ingestResult: { $ref: "#/components/schemas/IngestResult" },
       jobId: { type: "string", format: "uuid" },
@@ -161,6 +169,7 @@ const agentSchemas = {
       leaseToken: { type: "string", minLength: 32 },
       jobVersion: { type: "integer", minimum: 1 },
       expectedState: { type: "string" },
+      failureCode: { $ref: "#/components/schemas/FailureCode" },
       state: { type: "string" },
       step: { type: "string", minLength: 1, maxLength: 80 },
       outputHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
@@ -169,6 +178,52 @@ const agentSchemas = {
       pipelineArtifacts: { type: "array", minItems: 1, maxItems: 100, items: { $ref: "#/components/schemas/PipelineArtifact" } },
       preview: { $ref: "#/components/schemas/PreviewDescriptor" },
       segmentIds: { type: "array", items: { type: "string", format: "uuid" } },
+    },
+    additionalProperties: false,
+  },
+};
+const browserSchemas = {
+  CreateImportRequest: {
+    type: "object",
+    required: ["locator", "rightsEvidence"],
+    properties: {
+      allowedProcessors: {
+        type: "array",
+        maxItems: 2,
+        uniqueItems: true,
+        default: [],
+        items: { type: "string", enum: ["GOOGLE_GEMINI", "AZURE_SPEECH"] },
+      },
+      locator: { $ref: "#/components/schemas/IngestLocator" },
+      rightsEvidence: { type: "string", minLength: 1, maxLength: 2000 },
+    },
+    additionalProperties: false,
+  },
+  JobDetailResponse: {
+    type: "object",
+    required: ["jobId", "jobType", "lastEventType", "latestScript", "retentionDeadlineUtc", "state", "step", "version"],
+    properties: {
+      jobId: { type: "string", format: "uuid" },
+      jobType: { type: "string" },
+      lastEventType: { type: ["string", "null"] },
+      latestScript: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["contentHash", "version"],
+            properties: {
+              contentHash: { type: "string", pattern: "^[a-f0-9]{64}$" },
+              version: { type: "integer", minimum: 1 },
+            },
+            additionalProperties: false,
+          },
+          { type: "null" },
+        ],
+      },
+      retentionDeadlineUtc: { type: ["string", "null"], format: "date-time" },
+      state: { $ref: "#/components/schemas/ProcessingState" },
+      step: { type: "string", minLength: 1 },
+      version: { type: "integer", minimum: 1 },
     },
     additionalProperties: false,
   },
@@ -207,6 +262,20 @@ const pyWithPipelineArtifacts = pyWithPreview
     "    importInput: ImportInput | None = None\n",
     "    importInput: ImportInput | None = None\n    ingestResult: IngestResult | None = None\n    pipelineInput: PipelineClaimInput | None = None\n",
   );
+const pyWithCleanupAndFailures = (template: string) =>
+  template
+    .replace(
+      "class ClaimJobResponse(BaseModel):",
+      "class CleanupInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    targetJobId: str\n\n\nFailureCode = Literal[\"RETRYABLE_NETWORK\", \"RATE_LIMITED\", \"AUTH_REQUIRED\", \"RIGHTS_BLOCKED\", \"QUOTA_EXHAUSTED\", \"INVALID_AI_RESPONSE\", \"MEDIA_INVALID\", \"DISK_PRESSURE\", \"MANUAL_REVIEW_REQUIRED\"]\n\n\nclass ClaimJobResponse(BaseModel):",
+    )
+    .replace(
+      "    model_config = ConfigDict(extra=\"forbid\")\n    importInput: ImportInput | None = None\n",
+      "    model_config = ConfigDict(extra=\"forbid\")\n    cleanupInput: CleanupInput | None = None\n    importInput: ImportInput | None = None\n",
+    )
+    .replace(
+      "    expectedState: str\n    state: str\n",
+      "    expectedState: str\n    failureCode: FailureCode | None = None\n    state: str\n",
+    );
 const pyWithExtractionPipeline = pyWithPipelineArtifacts
   .replace(
     "class TranscriptionPipelineInput(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    normalizedMedia: PipelineArtifact\n    state: Literal[\"TRANSCRIBING\"]",
@@ -236,9 +305,9 @@ try {
   // OpenAPI generator dependencies are available. Never emit a partial schema.
   throw new Error("Generated OpenAPI artifact is missing; install generator dependencies before first generation");
 }
-schemaArtifact.components.schemas = { ...schemaArtifact.components.schemas, ...agentSchemas };
+schemaArtifact.components.schemas = { ...schemaArtifact.components.schemas, ...agentSchemas, ...browserSchemas };
 const requiredSchemas = [
-  "ApiError", "ApprovePublishRequest", "ApproveScriptRequest", "ClaimJobRequest", "ClaimJobResponse", "CompleteStepRequest", "ExtractionPipelineInput", "ImportInput", "IngestResult", "PipelineArtifact", "PipelineClaimInput", "PreviewDescriptor", "TechnicalMetadata",
+  "ApiError", "ApprovePublishRequest", "ApproveScriptRequest", "CleanupInput", "ClaimJobRequest", "ClaimJobResponse", "CompleteStepRequest", "FailureCode", "JobDetailResponse", "ExtractionPipelineInput", "ImportInput", "IngestResult", "PipelineArtifact", "PipelineClaimInput", "PreviewDescriptor", "TechnicalMetadata",
   "CreateImportRequest", "DashboardInboxResponse",
   "DestinationState", "HeartbeatRequest", "ProcessingState", "RenderReviewResponse",
   "SegmentReviewResponse", "SourceState",
@@ -260,5 +329,5 @@ for (const [schemaName, fields] of Object.entries(requiredJobFields)) {
 }
 await writeFile(openapiPath, `${JSON.stringify(schemaArtifact, null, 2)}\n`);
 await writeFile(tsPath, ts);
-await writeFile(pyPath, pyWithExtractionPipeline);
+await writeFile(pyPath, pyWithCleanupAndFailures(pyWithExtractionPipeline));
 console.log("Generated OpenAPI, TypeScript and Python contract models.");

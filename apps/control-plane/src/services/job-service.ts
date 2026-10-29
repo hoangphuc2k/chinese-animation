@@ -2,6 +2,7 @@ import type { DestinationState, ProcessingState } from "../../../../packages/con
 
 import { assertDestinationTransition } from "../domain/destination-state-machine";
 import { assertJobTransition } from "../domain/job-state-machine";
+import type { SqlDatabase } from "../repositories/sql";
 
 export interface WorkflowStatement {
   bind(...values: unknown[]): WorkflowStatement;
@@ -46,8 +47,8 @@ export interface TransitionDestinationInput {
 
 export interface CreateImportJobInput {
   actorId: string;
-  allowedProcessors: readonly string[];
   actorType: string;
+  allowedProcessors: readonly string[];
   jobId: string;
   nowUtc: string;
   projectId: string;
@@ -77,6 +78,35 @@ export class StaleWorkflowError extends Error {
   }
 }
 
+export interface CreatedImport {
+  jobId: string;
+  sourceAssetId: string;
+}
+
+export class ActiveImportExistsError extends Error {
+  constructor(readonly activeJobId: string | null) {
+    super("The source already has an import in progress.");
+  }
+}
+
+export class SourceOwnedByAnotherProjectError extends Error {
+  constructor() {
+    super("The source was already imported into a different project.");
+  }
+}
+
+export class SourceRightsRevokedError extends Error {
+  constructor() {
+    super("The source's rights were revoked; it cannot be imported again.");
+  }
+}
+
+const terminalJobStates = ["COMPLETED", "FAILED", "CANCELLED", "EXPIRED", "RIGHTS_BLOCKED"] as const;
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Error && /UNIQUE constraint failed/i.test(error.message);
+}
+
 export class RetryNotAllowedError extends Error {
   constructor() {
     super("Only a failed or cancelled job can be retried.");
@@ -90,30 +120,53 @@ async function sha256(value: string): Promise<string> {
 
 export class JobService {
   constructor(
-    private readonly database: WorkflowDatabase,
+    private readonly database: SqlDatabase & WorkflowDatabase,
     private readonly newId: () => string = () => crypto.randomUUID(),
   ) {}
 
-  async createImport(input: CreateImportJobInput): Promise<void> {
+  async createImport(input: CreateImportJobInput): Promise<CreatedImport> {
     const sourceContentHash = await sha256(input.sourceMetadataJson);
     const rightsEvidenceHash = await sha256(input.rightsEvidence);
-    await this.database.batch([
-      this.database
+    const rightsMetadataJson = JSON.stringify({ allowedProcessors: [...input.allowedProcessors], evidenceHash: rightsEvidenceHash });
+    const existing = await this.database
+      .prepare("SELECT id, project_id, rights_revoked_at FROM source_assets WHERE source_provider = ? AND external_id = ?")
+      .bind(input.sourceProvider, input.sourceExternalId)
+      .first<{ id: string; project_id: string; rights_revoked_at: string | null }>();
+    if (existing && existing.project_id !== input.projectId) throw new SourceOwnedByAnotherProjectError();
+    if (existing?.rights_revoked_at) throw new SourceRightsRevokedError();
+    if (existing) {
+      const active = await this.database
         .prepare(
-          "INSERT INTO source_assets (id, project_id, source_provider, external_id, metadata_json, content_hash, byte_count, rights_metadata_json, rights_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `SELECT id FROM jobs WHERE source_asset_id = ? AND job_type = 'IMPORT' AND status NOT IN (${terminalJobStates.map(() => "?").join(", ")}) LIMIT 1`,
         )
-        .bind(
-          input.sourceAssetId,
-          input.projectId,
-          input.sourceProvider,
-          input.sourceExternalId,
-          input.sourceMetadataJson,
-          sourceContentHash,
-          0,
-          JSON.stringify({ allowedProcessors: [...new Set(input.allowedProcessors)].sort(), evidenceHash: rightsEvidenceHash }),
-          null,
-          input.nowUtc,
-        ),
+        .bind(existing.id, ...terminalJobStates)
+        .first<{ id: string }>();
+      if (active) throw new ActiveImportExistsError(active.id);
+    }
+    const sourceAssetId = existing?.id ?? input.sourceAssetId;
+    // A re-import reuses the asset with a fresh rights snapshot (spec section 10).
+    const assetStatement = existing
+      ? this.database
+          .prepare("UPDATE source_assets SET metadata_json = ?, content_hash = ?, rights_metadata_json = ? WHERE id = ? AND rights_revoked_at IS NULL")
+          .bind(input.sourceMetadataJson, sourceContentHash, rightsMetadataJson, sourceAssetId)
+      : this.database
+          .prepare(
+            "INSERT INTO source_assets (id, project_id, source_provider, external_id, metadata_json, content_hash, byte_count, rights_metadata_json, rights_expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .bind(
+            sourceAssetId,
+            input.projectId,
+            input.sourceProvider,
+            input.sourceExternalId,
+            input.sourceMetadataJson,
+            sourceContentHash,
+            0,
+            rightsMetadataJson,
+            null,
+            input.nowUtc,
+          );
+    const statements = [
+      assetStatement,
       this.database
         .prepare(
           "INSERT INTO jobs (id, project_id, source_asset_id, job_type, status, step, priority, available_at, attempt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -121,7 +174,7 @@ export class JobService {
         .bind(
           input.jobId,
           input.projectId,
-          input.sourceAssetId,
+          sourceAssetId,
           "IMPORT",
           "QUEUED",
           "QUEUED",
@@ -155,7 +208,14 @@ export class JobService {
           "{}",
           input.nowUtc,
         ),
-    ]);
+    ];
+    try {
+      await this.database.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) throw new ActiveImportExistsError(null);
+      throw error;
+    }
+    return { jobId: input.jobId, sourceAssetId };
   }
 
   async transition(input: TransitionJobInput): Promise<void> {
@@ -230,20 +290,29 @@ export class JobService {
 
   async retry(input: RetryJobInput): Promise<void> {
     if (input.expectedState !== "FAILED" && input.expectedState !== "CANCELLED") throw new RetryNotAllowedError();
+    const retriedJob = "EXISTS (SELECT 1 FROM jobs WHERE id = ? AND status = 'QUEUED' AND version = ?)";
+    const retriedJobValues = [input.jobId, input.expectedVersion + 1];
     const statements = [
       this.database
         .prepare(
-          "UPDATE jobs SET status = ?, step = ?, version = version + 1, attempt_count = attempt_count + 1, available_at = ?, updated_at = ? WHERE id = ? AND status = ? AND version = ?",
+          // A retry starts a new cycle: fresh per-step attempts, no retention deadline, and it waits
+          // while a cleanup of this job is actively running.
+          "UPDATE jobs SET status = ?, step = ?, version = version + 1, attempt_count = 0, retention_deadline = NULL, available_at = ?, updated_at = ? WHERE id = ? AND status = ? AND version = ? AND NOT EXISTS (SELECT 1 FROM jobs cleanup WHERE cleanup.target_job_id = jobs.id AND cleanup.job_type = 'DELETE_EXPIRED' AND cleanup.status = 'QUEUED' AND cleanup.lease_until > ?)",
         )
-        .bind("QUEUED", "QUEUED", input.nowUtc, input.nowUtc, input.jobId, input.expectedState, input.expectedVersion),
+        .bind("QUEUED", "QUEUED", input.nowUtc, input.nowUtc, input.jobId, input.expectedState, input.expectedVersion, input.nowUtc),
       this.database
         .prepare(
-          "INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          `UPDATE jobs SET status = 'CANCELLED', step = 'TARGET_RETRIED', version = version + 1, updated_at = ? WHERE job_type = 'DELETE_EXPIRED' AND target_job_id = ? AND status = 'QUEUED' AND ${retriedJob}`,
         )
-        .bind(input.eventId, input.jobId, input.operation, input.expectedState, "QUEUED", "{}", input.nowUtc),
+        .bind(input.nowUtc, input.jobId, ...retriedJobValues),
       this.database
         .prepare(
-          "INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `INSERT INTO job_events (id, job_id, event_type, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${retriedJob}`,
+        )
+        .bind(input.eventId, input.jobId, input.operation, input.expectedState, "QUEUED", "{}", input.nowUtc, ...retriedJobValues),
+      this.database
+        .prepare(
+          `INSERT INTO audit_events (id, actor_id, actor_type, operation, target_type, target_id, target_version, target_hash, request_id, previous_state, next_state, details_json, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${retriedJob}`,
         )
         .bind(
           this.newId(),
@@ -259,6 +328,7 @@ export class JobService {
           "QUEUED",
           "{}",
           input.nowUtc,
+          ...retriedJobValues,
         ),
     ];
     const results = await this.database.batch(statements);

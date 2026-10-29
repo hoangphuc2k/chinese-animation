@@ -232,8 +232,10 @@ export function createAgentAuthenticator(options: AgentAuthOptions): MiddlewareH
   return async (context, next) => {
     try {
       const claims = await verifier.verify(tokenFromRequest(context.req.raw));
+      // Access service-token JWTs carry the client ID in common_name and an empty sub.
+      if (claims.sub !== "") throw new AuthenticationError("JWT is not a service-token identity");
       const actorId = requiredString(claims.common_name, "common_name");
-      if (actorId !== options.serviceClientId) throw new AuthenticationError("service token Client ID does not match");
+      if (actorId !== options.serviceClientId) throw new AuthenticationError("service client ID does not match");
       context.set("auth", { actorId, kind: "agent", role: "agent" });
       await next();
     } catch {

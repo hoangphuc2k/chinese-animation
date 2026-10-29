@@ -1,11 +1,11 @@
 import { Hono } from "hono";
 
-import { ApprovePublishRequest } from "../../../../packages/contracts/src/publishing";
+import { ApprovePublishRequest, publishMetadataHash } from "../../../../packages/contracts/src/publishing";
 import type { AuthContext } from "../middleware/access-auth";
 import { Action, authorize } from "../middleware/authorize";
 import { createRepositories } from "../repositories";
 import { IdempotencyConflictError, IdempotencyService, createIdempotencyStore } from "../services/idempotency-service";
-import { ApprovalMismatchError, ApprovalService } from "../services/approval-service";
+import { ApprovalMismatchError, ApprovalService, DestinationInFlightError } from "../services/approval-service";
 import type { BrowserWorkflowRoutesOptions } from "./project-routes";
 
 type BrowserWorkflowVariables = { Variables: AuthContext };
@@ -31,7 +31,7 @@ export function createPublicationRoutes(options: BrowserWorkflowRoutesOptions): 
   const ids = options.newId ?? (() => crypto.randomUUID());
   const nowUtc = options.nowUtc ?? (() => new Date().toISOString());
   const requestId = options.requestId ?? (() => crypto.randomUUID());
-  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), ids, nowUtc);
+  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), undefined, nowUtc);
   const approvals = new ApprovalService(options.database, ids);
 
   routes.post("/jobs/:jobId/publish-approval", authorize(Action.ApprovePublish), async (context) => {
@@ -45,6 +45,13 @@ export function createPublicationRoutes(options: BrowserWorkflowRoutesOptions): 
     if (!idempotencyKey) return problem("VALIDATION_FAILED", "Idempotency-Key is required.", requestId(), 400);
     const jobId = context.req.param("jobId");
     if (!(await repositories.jobs.get(jobId))) return problem("NOT_FOUND", "Job was not found.", requestId(), 404);
+    // The approved hash must describe exactly the metadata submitted with it.
+    if ((await publishMetadataHash(body.data.metadata)) !== body.data.metadataHash) {
+      return problem("VALIDATION_FAILED", "metadataHash does not match the submitted metadata.", requestId(), 400);
+    }
+    if (body.data.scheduleAtUtc !== null && Date.parse(body.data.scheduleAtUtc) <= Date.parse(nowUtc())) {
+      return problem("VALIDATION_FAILED", "scheduleAtUtc must be in the future.", requestId(), 400);
+    }
     try {
       const result = await idempotency.execute(
         { actorId: identity.actorId, body: body.data, idempotencyKey, operation: "APPROVE_PUBLISH", route: context.req.path },
@@ -76,7 +83,11 @@ export function createPublicationRoutes(options: BrowserWorkflowRoutesOptions): 
       );
       return context.json(result.body, result.status as 202);
     } catch (error) {
-      if (error instanceof IdempotencyConflictError || error instanceof ApprovalMismatchError) {
+      if (
+        error instanceof IdempotencyConflictError ||
+        error instanceof ApprovalMismatchError ||
+        error instanceof DestinationInFlightError
+      ) {
         return problem("CONFLICT", error.message, requestId(), 409);
       }
       throw error;

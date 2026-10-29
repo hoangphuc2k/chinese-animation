@@ -8,6 +8,7 @@ import { Action, authorize } from "../middleware/authorize";
 import { createRepositories } from "../repositories";
 import { IdempotencyConflictError, IdempotencyService, createIdempotencyStore } from "../services/idempotency-service";
 import { ApprovalMismatchError, ApprovalService } from "../services/approval-service";
+import { StaleWorkflowError } from "../services/job-service";
 import type { BrowserWorkflowRoutesOptions } from "./project-routes";
 
 const ScriptEditRequest = z
@@ -44,7 +45,7 @@ export function createScriptRoutes(options: BrowserWorkflowRoutesOptions): Hono<
   const ids = options.newId ?? (() => crypto.randomUUID());
   const nowUtc = options.nowUtc ?? (() => new Date().toISOString());
   const requestId = options.requestId ?? (() => crypto.randomUUID());
-  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), ids, nowUtc);
+  const idempotency = new IdempotencyService(createIdempotencyStore(repositories.idempotency), undefined, nowUtc);
   const approvals = new ApprovalService(options.database, ids);
 
   routes.post("/jobs/:jobId/scripts", authorize(Action.EditScript), async (context) => {
@@ -113,7 +114,7 @@ export function createScriptRoutes(options: BrowserWorkflowRoutesOptions): Hono<
       );
       return context.json(result.body, result.status as 202);
     } catch (error) {
-      if (error instanceof IdempotencyConflictError || error instanceof ApprovalMismatchError) {
+      if (error instanceof IdempotencyConflictError || error instanceof ApprovalMismatchError || error instanceof StaleWorkflowError) {
         return problem("CONFLICT", error.message, requestId(), 409);
       }
       throw error;
